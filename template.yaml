@@ -1,0 +1,173 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Bedrock Usage Dashboard — serverless 跨账号 token/成本估算看板。
+  单 Lambda + Function URL(AWS_IAM) + CloudFront(OAC) + CloudFront Function(Basic Auth) + Secrets。
+  部署: aws cloudformation package + deploy (或 sam deploy)。详见 README。
+
+Parameters:
+  DashUser:
+    Type: String
+    Default: admin
+    Description: 看板登录用户名
+  DashPass:
+    Type: String
+    NoEcho: true
+    Description: 看板登录密码(Basic Auth)
+
+Resources:
+
+  PricesSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}/prices"
+      Description: Bedrock dashboard unit prices (USD/1M tokens)
+      SecretString: '{"opus":{"in":5,"out":25,"cache_read":0.5,"cache_write":7.0},"sonnet":{"in":3,"out":15,"cache_read":0.3,"cache_write":3.75},"haiku":{"in":1,"out":5,"cache_read":0.1,"cache_write":1.25},"fable":{"in":10,"out":50,"cache_read":1.0,"cache_write":12.5},"nova":{"in":0.3,"out":1.2,"cache_read":0.03,"cache_write":0.375}}'
+
+  AccountsSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}/accounts"
+      Description: Registered accounts for cross-account Bedrock dashboard
+      SecretString: '[]'
+
+  DashboardRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: dashboard-perms
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: Read
+                Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:ListMetrics
+                  - bedrock:ListInferenceProfiles
+                  - bedrock:GetInferenceProfile
+                  - ec2:DescribeRegions
+                  - pricing:GetProducts
+                Resource: '*'
+              - Sid: AssumeReaders
+                Effect: Allow
+                Action: sts:AssumeRole
+                Resource: arn:aws:iam::*:role/BedrockUsageReader
+              - Sid: Secrets
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:PutSecretValue
+                Resource:
+                  - !Ref PricesSecret
+                  - !Ref AccountsSecret
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  DashboardFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}"
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      CodeUri: .
+      Timeout: 60
+      MemorySize: 1024
+      Role: !GetAtt DashboardRole.Arn
+      Environment:
+        Variables:
+          PRICE_SECRET: !Ref PricesSecret
+          ACCOUNTS_SECRET: !Ref AccountsSecret
+
+  FunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !Ref DashboardFunction
+      AuthType: AWS_IAM
+
+  OAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-oac"
+        OriginAccessControlOriginType: lambda
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  AuthFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub "${AWS::StackName}-basicauth"
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Basic auth for Bedrock dashboard
+        Runtime: cloudfront-js-2.0
+      FunctionCode: !Sub
+        - 'function handler(event){var r=event.request,a=r.headers.authorization;var e="Basic ${B64}";if(!a||a.value!==e){return{statusCode:401,statusDescription:"Unauthorized",headers:{"www-authenticate":{value:''Basic realm="Bedrock Dashboard"''}}};}return r;}'
+        - B64:
+            Fn::Base64:
+              Fn::Sub: "${DashUser}:${DashPass}"
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: Bedrock usage dashboard
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: lambda-origin
+            DomainName: !Select [2, !Split ["/", !GetAtt FunctionUrl.FunctionUrl]]
+            OriginAccessControlId: !GetAtt OAC.Id
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+        DefaultCacheBehavior:
+          TargetOriginId: lambda-origin
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad        # CachingDisabled
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac # AllViewerExceptHostHeader
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt AuthFunction.FunctionARN
+
+  InvokeUrlPerm:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DashboardFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: cloudfront.amazonaws.com
+      SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+      FunctionUrlAuthType: AWS_IAM
+
+  InvokeFnPerm:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DashboardFunction
+      Action: lambda:InvokeFunction
+      Principal: cloudfront.amazonaws.com
+      SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+
+Outputs:
+  DashboardURL:
+    Description: 看板地址(用 DashUser/DashPass 登录)
+    Value: !Sub "https://${Distribution.DomainName}/"
+  CentralRoleArn:
+    Description: 中心角色 ARN(纳管其他账号时填入 onboard-account.yaml)
+    Value: !GetAtt DashboardRole.Arn

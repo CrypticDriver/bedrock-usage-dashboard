@@ -40,23 +40,46 @@
 
 ## 🚀 一键部署
 
-前置:已配置 AWS 凭证、`aws` CLI v2、`zip`、`python3`。
+前置:已配置 AWS 凭证。任选一种:
+
+### 方式 A — CloudFormation / SAM(推荐)
+
+整套资源由一个模板 `template.yaml` 创建。无需安装 SAM CLI,用 AWS CLI 即可(`cloudformation package` 会自动上传 Lambda 代码,SAM 变换由 CloudFormation 服务端处理):
 
 ```bash
 git clone https://github.com/CrypticDriver/bedrock-usage-dashboard.git
 cd bedrock-usage-dashboard
-DASH_PASS='你的登录密码' ./deploy.sh
+
+aws s3 mb s3://<你的部署桶>            # 已有桶可跳过
+aws cloudformation package \
+  --template-file template.yaml \
+  --s3-bucket <你的部署桶> \
+  --output-template-file packaged.yaml
+aws cloudformation deploy \
+  --template-file packaged.yaml \
+  --stack-name bedrock-dashboard \
+  --capabilities CAPABILITY_IAM \
+  --parameter-overrides DashUser=admin DashPass='你的密码'
+
+# 取看板地址
+aws cloudformation describe-stacks --stack-name bedrock-dashboard \
+  --query "Stacks[0].Outputs[?OutputKey=='DashboardURL'].OutputValue" --output text
 ```
 
-可选环境变量:`REGION`(默认 `us-west-2`)、`DASH_USER`(默认 `admin`)、`DASH_PASS`(默认 `BedrockUsage2026`)。
+装了 SAM CLI 的话更简单:`sam deploy --guided`(同一个 `template.yaml`)。
 
-部署完成后输出看板地址 `https://xxxxx.cloudfront.net/`(首次分发约需 5–10 分钟)。用设置的用户名/密码登录。
+卸载:`aws cloudformation delete-stack --stack-name bedrock-dashboard`
 
-### 卸载
+### 方式 B — Bash 脚本
 
 ```bash
-./destroy.sh      # 删除 Lambda / CloudFront / OAC / CF Function / IAM 角色(密钥保留)
+DASH_PASS='你的登录密码' ./deploy.sh      # 需 aws cli v2 / zip / python3
 ```
+
+可选环境变量:`REGION`(默认 `us-west-2`)、`DASH_USER`、`DASH_PASS`。卸载:`./destroy.sh`。
+
+> 两种方式等价。CloudFormation 便于纳入 IaC / 变更管理;Bash 脚本零依赖、步骤直观。
+> 首次 CloudFront 分发约需 5–10 分钟。完成后用设置的用户名/密码登录。
 
 ## 🏢 接入其他账号(跨 Org)
 
