@@ -19,15 +19,24 @@
 
 ## 🏗 架构
 
+```mermaid
+flowchart TD
+  U["👤 用户浏览器"] -->|"HTTPS + Basic Auth"| CF["CloudFront Distribution<br/>(CloudFront Function:<br/>viewer-request Basic Auth)"]
+  CF -->|"OAC · SigV4 签名"| FURL["Lambda Function URL<br/>AuthType = AWS_IAM(非公开)"]
+
+  subgraph CENTRAL["中心账号"]
+    FURL --> L["Lambda · bedrock-dashboard<br/>HTML 页面 + JSON API"]
+    L -->|"读 token 指标"| CW["CloudWatch<br/>AWS/Bedrock"]
+    L -->|"单价 / 账号注册表"| SM["Secrets Manager<br/>prices · accounts"]
+    L -.->|"可选: 官方单价"| PR["AWS Price List API"]
+  end
+
+  L -->|"sts:AssumeRole + ExternalId"| RR
+  subgraph ORG["其他账号(可跨 Organization)"]
+    RR["BedrockUsageReader<br/>只读角色"] -->|"读 token 指标"| CW2["CloudWatch<br/>AWS/Bedrock"]
+  end
 ```
-浏览器 ──HTTPS──> CloudFront ──(viewer-request: Basic Auth 校验)
-                     │
-                     └─ OAC SigV4 签名 ─> Lambda Function URL (AuthType=AWS_IAM, 非公开)
-                                              │
-                                              ├─ 本账号: 直接读 CloudWatch AWS/Bedrock
-                                              └─ 远程账号: sts:AssumeRole → BedrockUsageReader(只读)→ 读 CloudWatch
-                     单价 / 账号注册表: AWS Secrets Manager
-```
+
 
 | 组件 | 作用 |
 |------|------|
