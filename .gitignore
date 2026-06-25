@@ -1,0 +1,10 @@
+# secrets / local
+auth.txt
+extid.txt
+prices.json
+accounts.json
+*.zip
+function.zip
+.DS_Store
+__pycache__/
+*.pyc

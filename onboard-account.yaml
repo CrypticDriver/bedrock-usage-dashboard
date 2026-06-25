@@ -1,0 +1,48 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  BedrockUsageReader - 只读角色,授权中心 Bedrock 看板跨账号读取 CloudWatch token 指标。
+  在每个要纳管的账号里部署本模板(任意区域,IAM 为全局)。
+
+Parameters:
+  CentralRoleArn:
+    Type: String
+    Default: arn:aws:iam::CENTRAL_ACCOUNT_ID:role/bedrock-dashboard-role
+    Description: 中心看板 Lambda 的角色 ARN(允许它 assume 本角色)
+  ExternalId:
+    Type: String
+    Description: 防混淆代理用的 ExternalId(从看板"添加账号"页面复制)
+    NoEcho: true
+
+Resources:
+  BedrockUsageReader:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: BedrockUsageReader
+      Description: Read-only Bedrock usage for central dashboard
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Ref CentralRoleArn
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref ExternalId
+      Policies:
+        - PolicyName: bedrock-cw-readonly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:ListMetrics
+                  - bedrock:ListInferenceProfiles
+                  - bedrock:GetInferenceProfile
+                Resource: '*'
+
+Outputs:
+  RoleArn:
+    Description: 把这个 ARN 填到看板"添加账号"页
+    Value: !GetAtt BedrockUsageReader.Arn
