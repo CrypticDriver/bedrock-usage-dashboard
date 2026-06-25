@@ -19,6 +19,11 @@
 
 ## 🏗 架构
 
+![架构图](docs/architecture.png)
+
+<details>
+<summary>Mermaid 源(可编辑)</summary>
+
 ```mermaid
 flowchart TD
   U["👤 用户浏览器"] -->|"HTTPS + Basic Auth"| CF["CloudFront Distribution<br/>(CloudFront Function:<br/>viewer-request Basic Auth)"]
@@ -36,6 +41,9 @@ flowchart TD
     RR["BedrockUsageReader<br/>只读角色"] -->|"读 token 指标"| CW2["CloudWatch<br/>AWS/Bedrock"]
   end
 ```
+
+</details>
+
 
 
 | 组件 | 作用 |
