@@ -550,6 +550,7 @@ select,input{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,
 button{background:linear-gradient(135deg,#a5b4fc,#f0abfc);color:#0b1020;border:none;
   padding:9px 20px;border-radius:10px;font-weight:600;cursor:pointer;font-size:14px}
 button:hover{opacity:.9}
+button:disabled{opacity:.35;cursor:not-allowed;filter:grayscale(1)}
 .preset{background:rgba(255,255,255,.07);color:#cdd6ff;border:1px solid rgba(255,255,255,.16);
   padding:8px 14px;font-weight:500}
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:14px;margin-bottom:22px}
@@ -672,7 +673,7 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
           <option>eu-central-1</option><option>ap-southeast-1</option><option>ap-northeast-1</option>
         </select>
         <label>日志组</label><input id="grayLg" value="br_invocation_loggroup" style="width:240px"/>
-        <button onclick="loadGray()">查询灰区</button>
+        <button id="grayBtn" onclick="loadGray()">查询灰区</button>
         <span id="grayMeta" class="muted"></span>
       </div>
       <div class="cards" id="grayCards"></div>
@@ -821,16 +822,20 @@ function toggleGray(){
 async function grayPickRegion(){
   const region=document.getElementById('grayRegion').value;
   const account=encodeURIComponent(document.getElementById('account').value);
-  const m=document.getElementById('grayMeta');m.textContent='检测日志组…';
+  const m=document.getElementById('grayMeta'),btn=document.getElementById('grayBtn');
+  m.textContent='检测日志组…';btn.disabled=true;
   try{
     const d=await getJSON(`?format=loggroup&region=${region}&account=${account}`);
     if(d.logGroup){
       document.getElementById('grayLg').value=d.logGroup;
       m.textContent=`✓ 已自动选中日志组(正文记录=${d.text})`;
+      btn.disabled=false;
     }else{
-      m.textContent='⚠️ 该区域未配置调用日志(可用 enable-invocation-logging.sh 开启)';
+      document.getElementById('grayLg').value='';
+      m.textContent='⚠️ 该区域未配置调用日志(用 enable-invocation-logging.sh 开启后再查)';
+      btn.disabled=true;
     }
-  }catch(e){m.textContent='';}
+  }catch(e){m.textContent='检测失败: '+e.message;btn.disabled=true;}
 }
 async function loadGray(){
   const lg=document.getElementById('grayLg').value.trim()||'br_invocation_loggroup';
