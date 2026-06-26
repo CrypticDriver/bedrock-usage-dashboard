@@ -548,7 +548,7 @@ button:hover{opacity:.9}
 .card .tag{font-size:10px;color:#34d399;border:1px solid rgba(52,211,153,.4);
   border-radius:999px;padding:1px 7px;margin-left:6px;vertical-align:middle}
 .panel{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.12);
-  border-radius:16px;padding:18px 20px;margin-bottom:22px}
+  border-radius:16px;padding:18px 20px;margin:22px 0}
 .panel h3{font-size:14px;color:#cdd6ff;margin-bottom:12px;font-weight:600}
 .chartbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
 svg{width:100%;height:260px;display:block}
