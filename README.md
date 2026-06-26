@@ -115,6 +115,21 @@ DASH_PASS='你的登录密码' ./deploy.sh      # 需 aws cli v2 / zip / python3
 - **🔄 从 AWS 定价 API 拉取**:调用 `pricing:GetProducts` 拉官方价作为参考(仅覆盖 AWS 已发布的模型)
 - 匹配优先级:完整 ModelId 精确 > 家族关键字(opus/sonnet/haiku/fable/nova)
 
+## 🩶 运行时"灰区"统计(runtime gray area)
+
+被限流(429)、客户端 4xx、推理前失败的请求**不计 token、不计费**。唯一会"悄悄计费"的是**流式请求中途失败**——失败前已生成的 output token 仍计费(灰区)。
+
+`runtime_gray_area.py` 用 **Model Invocation Logging** 日志精确统计这部分(日志条目含 `errorCode` 与 token 数;**灰区 = errorCode 存在 且 outputTokenCount > 0**):
+
+```bash
+python3 runtime_gray_area.py --region us-east-1 --log-group br_invocation_loggroup --days 90
+# 或指定范围: --start 2026-03-01 --end 2026-06-01
+```
+
+输出:成功/失败总览、灰区 token(按模型+错误类型)、报错类型分布。
+
+> ⚠️ 仅 **bedrock-runtime** 端点:Model Invocation Logging 不记录 `bedrock-mantle`(Responses API)。需目标区域先开启 invocation logging 到 CloudWatch Logs。
+
 ## 📈 直接调用 API(可选)
 
 所有请求需 Basic Auth。
