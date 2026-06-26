@@ -651,6 +651,11 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
     </div>
     <div id="grayWrap" style="display:none">
       <div class="chartbar" style="margin:12px 0">
+        <label>区域</label>
+        <select id="grayRegion">
+          <option>us-east-1</option><option>us-west-2</option><option>us-east-2</option>
+          <option>eu-central-1</option><option>ap-southeast-1</option><option>ap-northeast-1</option>
+        </select>
         <label>日志组</label><input id="grayLg" value="br_invocation_loggroup" style="width:240px"/>
         <button onclick="loadGray()">查询灰区</button>
         <span id="grayMeta" class="muted"></span>
@@ -799,11 +804,14 @@ function toggleGray(){
 }
 async function loadGray(){
   const lg=document.getElementById('grayLg').value.trim()||'br_invocation_loggroup';
+  const region=document.getElementById('grayRegion').value;
+  const account=encodeURIComponent(document.getElementById('account').value);
+  const start=document.getElementById('start').value,end=document.getElementById('end').value;
   const m=document.getElementById('grayMeta');m.textContent='查询中(Logs Insights)…';
   document.getElementById('grayCards').innerHTML='';
   document.getElementById('grayTable').innerHTML='';
   try{
-    const d=await getJSON(`?format=gray&loggroup=${encodeURIComponent(lg)}&${qs()}`);
+    const d=await getJSON(`?format=gray&loggroup=${encodeURIComponent(lg)}&region=${region}&account=${account}&start=${start}&end=${end}`);
     m.textContent=`区域 ${d.region} · ${d.start}Z → ${d.end}Z · 日志组 ${d.log_group}`;
     document.getElementById('grayCards').innerHTML=`
       <div class="card"><div class="k">成功请求</div><div class="v">${fmt(d.success_calls)}</div></div>
