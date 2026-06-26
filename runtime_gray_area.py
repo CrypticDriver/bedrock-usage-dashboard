@@ -75,6 +75,19 @@ def main():
                   f"in {int(float(r.get('grayIn',0) or 0)):>8,}  out {o:>8,}  ({r.get('grayCalls')} 次)")
         print(f"  ── 灰区 output token 合计: {tot:,}")
 
+    billed_in = run_query(cw, a.log_group,
+        "filter ispresent(errorCode) and input.inputTokenCount > 0 | "
+        "stats count() as calls, sum(input.inputTokenCount) as inTok by modelId, errorCode", start, end)
+    print("\n== 失败请求中已计费的输入 token(input 被处理即计费,无论是否产出 output)==")
+    if not billed_in:
+        print("  ✅ 0:没有「输入已被模型处理」的失败请求")
+    else:
+        tot = 0
+        for r in billed_in:
+            i = int(float(r.get("inTok", 0) or 0)); tot += i
+            print(f"  {r.get('modelId','')[:60]:62} {r.get('errorCode',''):28} in {i:>8,}  ({r.get('calls')} 次)")
+        print(f"  ── 失败请求已计费输入 token 合计: {tot:,}")
+
     errs = run_query(cw, a.log_group,
         "filter ispresent(errorCode) | stats count() as n by errorCode", start, end)
     if errs:
