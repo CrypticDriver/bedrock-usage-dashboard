@@ -31,7 +31,7 @@ aws iam create-role --role-name "$ROLE" --assume-role-policy-document "file://$T
   && echo ">> 创建角色 $ROLE" || echo ">> 角色 $ROLE 已存在"
 cat > "$TMP/perms.json" <<EOF
 {"Version":"2012-10-17","Statement":[
- {"Sid":"Read","Effect":"Allow","Action":["cloudwatch:GetMetricData","cloudwatch:ListMetrics","bedrock:ListInferenceProfiles","bedrock:GetInferenceProfile","ec2:DescribeRegions","pricing:GetProducts","logs:StartQuery","logs:GetQueryResults","logs:StopQuery","logs:DescribeLogGroups"],"Resource":"*"},
+ {"Sid":"Read","Effect":"Allow","Action":["cloudwatch:GetMetricData","cloudwatch:ListMetrics","bedrock:ListInferenceProfiles","bedrock:GetInferenceProfile","bedrock:GetModelInvocationLoggingConfiguration","ec2:DescribeRegions","pricing:GetProducts","logs:StartQuery","logs:GetQueryResults","logs:StopQuery","logs:DescribeLogGroups"],"Resource":"*"},
  {"Sid":"AssumeReaders","Effect":"Allow","Action":"sts:AssumeRole","Resource":"arn:aws:iam::*:role/BedrockUsageReader"},
  {"Sid":"Secret","Effect":"Allow","Action":["secretsmanager:GetSecretValue","secretsmanager:PutSecretValue"],"Resource":["arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:bedrock-dashboard/*"]},
  {"Sid":"Logs","Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"}

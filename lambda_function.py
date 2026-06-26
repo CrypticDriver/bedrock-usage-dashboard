@@ -371,6 +371,19 @@ def build_series(region, model_id, start, end, sess=None):
             "estimate": True}
 
 
+def logging_log_group(region, sess=None):
+    """返回该区域已配置的调用日志 CloudWatch 日志组(用于前端自动选中)。"""
+    sess = sess or DEFAULT_SESS
+    try:
+        cfg = sess.client("bedrock", region_name=region, config=FAST) \
+            .get_model_invocation_logging_configuration().get("loggingConfig") or {}
+        cw = cfg.get("cloudWatchConfig") or {}
+        return {"region": region, "logGroup": cw.get("logGroupName"),
+                "text": cfg.get("textDataDeliveryEnabled")}
+    except Exception as e:
+        return {"region": region, "logGroup": None, "error": str(e)}
+
+
 def gray_area(region, log_group, start, end, sess=None):
     """从 Model Invocation Logging 日志统计失败请求的计费 token(仅 bedrock-runtime)。
     灰区: errorCode 存在;input 被处理即计费,output>0 为流式中途失败已产出部分。"""
@@ -494,6 +507,8 @@ def lambda_handler(event, context):
             if not q.get("model"):
                 return _json({"error": "missing model"}, 400)
             return _json(build_series(region, q["model"], start, end, session_for(account)))
+        if fmt == "loggroup":
+            return _json(logging_log_group(region, session_for(account)))
         if fmt == "gray":
             if region in ("global", "all"):
                 return _json({"error": "灰区查询请选择具体区域(日志按区存储)"}, 400)
@@ -652,7 +667,7 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
     <div id="grayWrap" style="display:none">
       <div class="chartbar" style="margin:12px 0">
         <label>区域</label>
-        <select id="grayRegion">
+        <select id="grayRegion" onchange="grayPickRegion()">
           <option>us-east-1</option><option>us-west-2</option><option>us-east-2</option>
           <option>eu-central-1</option><option>ap-southeast-1</option><option>ap-northeast-1</option>
         </select>
@@ -801,6 +816,21 @@ function toggleGray(){
   var w=document.getElementById('grayWrap'),open=w.style.display==='none';
   w.style.display=open?'block':'none';
   document.getElementById('grayToggle').textContent=open?'收起 ▴':'展开 ▾';
+  if(open) grayPickRegion();
+}
+async function grayPickRegion(){
+  const region=document.getElementById('grayRegion').value;
+  const account=encodeURIComponent(document.getElementById('account').value);
+  const m=document.getElementById('grayMeta');m.textContent='检测日志组…';
+  try{
+    const d=await getJSON(`?format=loggroup&region=${region}&account=${account}`);
+    if(d.logGroup){
+      document.getElementById('grayLg').value=d.logGroup;
+      m.textContent=`✓ 已自动选中日志组(正文记录=${d.text})`;
+    }else{
+      m.textContent='⚠️ 该区域未配置调用日志(可用 enable-invocation-logging.sh 开启)';
+    }
+  }catch(e){m.textContent='';}
 }
 async function loadGray(){
   const lg=document.getElementById('grayLg').value.trim()||'br_invocation_loggroup';

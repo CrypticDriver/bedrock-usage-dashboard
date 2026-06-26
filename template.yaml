@@ -52,6 +52,7 @@ Resources:
                   - cloudwatch:ListMetrics
                   - bedrock:ListInferenceProfiles
                   - bedrock:GetInferenceProfile
+                  - bedrock:GetModelInvocationLoggingConfiguration
                   - ec2:DescribeRegions
                   - pricing:GetProducts
                   - logs:StartQuery
