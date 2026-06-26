@@ -119,9 +119,18 @@ DASH_PASS='你的登录密码' ./deploy.sh      # 需 aws cli v2 / zip / python3
 
 被限流(429)、客户端 4xx、推理前失败的请求**不计 token、不计费**。会"悄悄计费"的是**失败请求里已被处理的 token**:输入只要被模型读入就计费;输出为**流式中途失败**已产出的部分。
 
-看板主页「**🩶 运行时灰区**」面板基于 **Model Invocation Logging** 日志精确统计这部分(日志条目含 `errorCode` 与 token 数,**灰区 = errorCode 存在**;无需 CloudTrail):展开 → 填日志组(默认 `br_invocation_loggroup`)→ 用当前「账号/区域/日期」查询,显示失败已计费的输入/输出 token 及按模型+错误类型的明细。
+看板主页「**🩶 运行时灰区**」面板基于 **Model Invocation Logging** 日志精确统计这部分(日志条目含 `errorCode` 与 token 数,**灰区 = errorCode 存在**;无需 CloudTrail):面板里选区域、填日志组(默认 `br_invocation_loggroup`)、用当前「账号/日期」查询,显示失败已计费的输入/输出 token 及按模型+错误类型的明细。
 
-> ⚠️ 仅 **bedrock-runtime** 端点:Model Invocation Logging 不记录 `bedrock-mantle`(Responses API)。需目标区域已开启 invocation logging 到 CloudWatch Logs,且区域不能选 `global`(日志按区存储)。
+**启用(可选,按区域一次性配置)** —— 核心部署不会动账号的日志配置,需要灰区时单独跑:
+
+```bash
+./enable-invocation-logging.sh us-west-2            # 仅元数据(token/errorCode),隐私优先
+./enable-invocation-logging.sh us-east-1 --with-text # 同时记录 prompt/响应正文
+```
+
+默认**只记元数据不记正文**(灰区统计只需 token 数与 errorCode)。该配置是账号+区域级、不可回溯、会覆盖该区已有日志配置。
+
+> ⚠️ 仅 **bedrock-runtime** 端点:Model Invocation Logging 不记录 `bedrock-mantle`(Responses API)。区域不能选 `global`(日志按区存储)。
 
 ## 📈 直接调用 API(可选)
 
