@@ -115,20 +115,13 @@ DASH_PASS='你的登录密码' ./deploy.sh      # 需 aws cli v2 / zip / python3
 - **🔄 从 AWS 定价 API 拉取**:调用 `pricing:GetProducts` 拉官方价作为参考(仅覆盖 AWS 已发布的模型)
 - 匹配优先级:完整 ModelId 精确 > 家族关键字(opus/sonnet/haiku/fable/nova)
 
-## 🩶 运行时"灰区"统计(runtime gray area)
+## 🩶 运行时"灰区"统计(看板内置面板)
 
-被限流(429)、客户端 4xx、推理前失败的请求**不计 token、不计费**。唯一会"悄悄计费"的是**流式请求中途失败**——失败前已生成的 output token 仍计费(灰区)。
+被限流(429)、客户端 4xx、推理前失败的请求**不计 token、不计费**。会"悄悄计费"的是**失败请求里已被处理的 token**:输入只要被模型读入就计费;输出为**流式中途失败**已产出的部分。
 
-`runtime_gray_area.py` 用 **Model Invocation Logging** 日志精确统计这部分(日志条目含 `errorCode` 与 token 数;**灰区 = errorCode 存在 且 outputTokenCount > 0**):
+看板主页「**🩶 运行时灰区**」面板基于 **Model Invocation Logging** 日志精确统计这部分(日志条目含 `errorCode` 与 token 数,**灰区 = errorCode 存在**;无需 CloudTrail):展开 → 填日志组(默认 `br_invocation_loggroup`)→ 用当前「账号/区域/日期」查询,显示失败已计费的输入/输出 token 及按模型+错误类型的明细。
 
-```bash
-python3 runtime_gray_area.py --region us-east-1 --log-group br_invocation_loggroup --days 90
-# 或指定范围: --start 2026-03-01 --end 2026-06-01
-```
-
-输出:成功/失败总览、灰区 token(按模型+错误类型)、报错类型分布。
-
-> ⚠️ 仅 **bedrock-runtime** 端点:Model Invocation Logging 不记录 `bedrock-mantle`(Responses API)。需目标区域先开启 invocation logging 到 CloudWatch Logs。
+> ⚠️ 仅 **bedrock-runtime** 端点:Model Invocation Logging 不记录 `bedrock-mantle`(Responses API)。需目标区域已开启 invocation logging 到 CloudWatch Logs,且区域不能选 `global`(日志按区存储)。
 
 ## 📈 直接调用 API(可选)
 
@@ -140,6 +133,7 @@ python3 runtime_gray_area.py --region us-east-1 --log-group br_invocation_loggro
 | `GET /?format=json&region=&start=&end=&account=` | 各模型用量+成本(估算) |
 | `GET /?format=accounts` | 已注册账号列表 |
 | `GET /?format=prices` | 当前单价 |
+| `GET /?format=gray&region=&loggroup=&account=` | 失败请求计费 token(运行时灰区) |
 
 时间:`start`/`end` 为 `YYYY-MM-DD`(UTC);或用 `days=30`。`region` 可填具体区或 `global`。
 

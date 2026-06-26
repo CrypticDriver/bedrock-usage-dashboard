@@ -371,6 +371,48 @@ def build_series(region, model_id, start, end, sess=None):
             "estimate": True}
 
 
+def gray_area(region, log_group, start, end, sess=None):
+    """从 Model Invocation Logging 日志统计失败请求的计费 token(仅 bedrock-runtime)。
+    灰区: errorCode 存在;input 被处理即计费,output>0 为流式中途失败已产出部分。"""
+    sess = sess or DEFAULT_SESS
+    logs = sess.client("logs", region_name=region, config=FAST)
+
+    def runq(qs):
+        qid = logs.start_query(logGroupName=log_group,
+                               startTime=int(start.timestamp()), endTime=int(end.timestamp()),
+                               queryString=qs)["queryId"]
+        for _ in range(50):
+            r = logs.get_query_results(queryId=qid)
+            if r["status"] == "Complete":
+                return [{c["field"]: c["value"] for c in row} for row in r["results"]]
+            if r["status"] in ("Failed", "Cancelled", "Timeout"):
+                raise RuntimeError("Logs Insights " + r["status"])
+            time.sleep(0.8)
+        raise RuntimeError("Logs Insights 查询超时")
+
+    def i(x):
+        return int(float(x or 0))
+
+    overview = runq("stats count() as calls, sum(output.outputTokenCount) as outTok "
+                    "by ispresent(errorCode) as isError")
+    detail = runq("filter ispresent(errorCode) | stats count() as calls, "
+                  "sum(input.inputTokenCount) as inTok, sum(output.outputTokenCount) as outTok "
+                  "by modelId, errorCode")
+    succ = next((r for r in overview if r.get("isError") == "0"), {})
+    fail = next((r for r in overview if r.get("isError") == "1"), {})
+    rows = [{"model": r.get("modelId", "").split("/")[-1], "errorCode": r.get("errorCode", ""),
+             "calls": i(r.get("calls")), "in": i(r.get("inTok")), "out": i(r.get("outTok"))}
+            for r in detail]
+    rows.sort(key=lambda x: -(x["in"] + x["out"]))
+    return {"region": region, "log_group": log_group,
+            "start": start.strftime("%Y-%m-%d %H:%M"), "end": end.strftime("%Y-%m-%d %H:%M"),
+            "success_calls": i(succ.get("calls")), "success_out": i(succ.get("outTok")),
+            "failed_calls": i(fail.get("calls")),
+            "billed_input_on_fail": sum(r["in"] for r in rows),
+            "gray_output_on_fail": sum(r["out"] for r in rows),
+            "rows": rows}
+
+
 def _range(q):
     now = dt.datetime.now(dt.UTC)
     try:
@@ -452,6 +494,11 @@ def lambda_handler(event, context):
             if not q.get("model"):
                 return _json({"error": "missing model"}, 400)
             return _json(build_series(region, q["model"], start, end, session_for(account)))
+        if fmt == "gray":
+            if region in ("global", "all"):
+                return _json({"error": "灰区查询请选择具体区域(日志按区存储)"}, 400)
+            lg = q.get("loggroup") or "br_invocation_loggroup"
+            return _json(gray_area(region, lg, start, end, session_for(account)))
     except Exception as e:
         return _json({"error": str(e)}, 500)
     return {"statusCode": 200,
@@ -597,6 +644,26 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
   </div>
   <div class="cards" id="cards"></div>
   <div id="table"></div>
+  <div class="panel">
+    <div class="phead" onclick="toggleGray()">
+      <h3>🩶 运行时灰区 <span class="muted">· 失败请求里已计费的 token · 仅 bedrock-runtime</span></h3>
+      <span class="chev" id="grayToggle">展开 ▾</span>
+    </div>
+    <div id="grayWrap" style="display:none">
+      <div class="chartbar" style="margin:12px 0">
+        <label>日志组</label><input id="grayLg" value="br_invocation_loggroup" style="width:240px"/>
+        <button onclick="loadGray()">查询灰区</button>
+        <span id="grayMeta" class="muted"></span>
+      </div>
+      <div class="cards" id="grayCards"></div>
+      <div id="grayTable"></div>
+      <div class="muted" style="margin-top:12px;line-height:1.7">
+        灰区 = 失败请求里已计费的 token:<b>输入</b>只要被模型处理就计费;<b>输出</b>为流式中途失败已产出的部分。
+        用所选「账号/区域/日期」+ 上面日志组,基于 <b>Model Invocation Logging</b> 精确统计。
+        ⚠️ 仅 bedrock-runtime(mantle/Responses API 不被记录);需该区域已开启 invocation logging,且区域不能选 global。
+      </div>
+    </div>
+  </div>
   </div>
   <div id="configView" style="display:none">
   <div class="panel">
@@ -724,6 +791,34 @@ function togglePrice(){
   const w=document.getElementById('priceWrap'),open=w.style.display==='none';
   w.style.display=open?'block':'none';
   document.getElementById('priceToggle').textContent=open?'收起 ▴':'展开 ▾';
+}
+function toggleGray(){
+  var w=document.getElementById('grayWrap'),open=w.style.display==='none';
+  w.style.display=open?'block':'none';
+  document.getElementById('grayToggle').textContent=open?'收起 ▴':'展开 ▾';
+}
+async function loadGray(){
+  const lg=document.getElementById('grayLg').value.trim()||'br_invocation_loggroup';
+  const m=document.getElementById('grayMeta');m.textContent='查询中(Logs Insights)…';
+  document.getElementById('grayCards').innerHTML='';
+  document.getElementById('grayTable').innerHTML='';
+  try{
+    const d=await getJSON(`?format=gray&loggroup=${encodeURIComponent(lg)}&${qs()}`);
+    m.textContent=`区域 ${d.region} · ${d.start}Z → ${d.end}Z · 日志组 ${d.log_group}`;
+    document.getElementById('grayCards').innerHTML=`
+      <div class="card"><div class="k">成功请求</div><div class="v">${fmt(d.success_calls)}</div></div>
+      <div class="card"><div class="k">失败请求</div><div class="v">${fmt(d.failed_calls)}</div></div>
+      <div class="card hl"><div class="k">失败已计费输入 token</div><div class="v">${fmt(d.billed_input_on_fail)}</div></div>
+      <div class="card hl"><div class="k">灰区输出 token</div><div class="v">${fmt(d.gray_output_on_fail)}</div></div>`;
+    if(!d.rows.length){
+      document.getElementById('grayTable').innerHTML='<div class="loading">✅ 无失败请求,灰区为 0</div>';return;
+    }
+    document.getElementById('grayTable').innerHTML=`<table>
+      <thead><tr><th>模型</th><th>错误类型</th><th>次数</th><th>计费输入</th><th>灰区输出</th></tr></thead>
+      <tbody>${d.rows.map(r=>`<tr><td>${r.model}</td>
+        <td><span class="pill ${r.out>0?'unknown':''}">${r.errorCode}</span></td>
+        <td>${fmt(r.calls)}</td><td>${fmt(r.in)}</td><td>${fmt(r.out)}</td></tr>`).join('')}</tbody></table>`;
+  }catch(e){m.textContent='';document.getElementById('grayTable').innerHTML=`<div class="err">查询失败: ${e.message}</div>`;}
 }
 function toggleView(){
   var m=document.getElementById('mainView'),c=document.getElementById('configView'),b=document.getElementById('navBtn');

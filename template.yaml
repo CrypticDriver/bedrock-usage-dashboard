@@ -54,6 +54,10 @@ Resources:
                   - bedrock:GetInferenceProfile
                   - ec2:DescribeRegions
                   - pricing:GetProducts
+                  - logs:StartQuery
+                  - logs:GetQueryResults
+                  - logs:StopQuery
+                  - logs:DescribeLogGroups
                 Resource: '*'
               - Sid: AssumeReaders
                 Effect: Allow
