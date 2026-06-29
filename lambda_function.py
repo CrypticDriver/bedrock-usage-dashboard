@@ -371,6 +371,81 @@ def build_series(region, model_id, start, end, sess=None):
             "estimate": True}
 
 
+ERROR_METRICS = {"Invocations": "calls", "InvocationClientErrors": "client",
+                 "InvocationServerErrors": "server", "InvocationThrottles": "throttle"}
+
+
+def _discover_ids(cw, metric):
+    ids = set()
+    for page in cw.get_paginator("list_metrics").paginate(Namespace="AWS/Bedrock", MetricName=metric):
+        for m in page["Metrics"]:
+            dims = {d["Name"]: d["Value"] for d in m["Dimensions"]}
+            if set(dims) == {"ModelId"}:
+                ids.add(dims["ModelId"])
+    return ids
+
+
+def region_errors(region, start, end, sess):
+    cw = sess.client("cloudwatch", region_name=region, config=FAST)
+    mids = set()
+    for met in ("Invocations", "InvocationClientErrors", "InvocationServerErrors", "InvocationThrottles"):
+        try:
+            mids |= _discover_ids(cw, met)
+        except Exception:
+            pass
+    if not mids:
+        return {}
+    keys = list(ERROR_METRICS.items())
+    q, idmap = [], {}
+    for mi, mid in enumerate(sorted(mids)):
+        for ki, (name, field) in enumerate(keys):
+            qid = f"e{mi}_{ki}"
+            idmap[qid] = (mid, field)
+            q.append({"Id": qid, "MetricStat": {
+                "Metric": {"Namespace": "AWS/Bedrock", "MetricName": name,
+                           "Dimensions": [{"Name": "ModelId", "Value": mid}]},
+                "Period": 86400, "Stat": "Sum"}})
+    agg = {mid: dict.fromkeys(ERROR_METRICS.values(), 0.0) for mid in mids}
+    for i in range(0, len(q), 500):
+        for page in cw.get_paginator("get_metric_data").paginate(
+                MetricDataQueries=q[i:i + 500], StartTime=start, EndTime=end):
+            for r in page["MetricDataResults"]:
+                mid, field = idmap[r["Id"]]
+                agg[mid][field] += sum(r["Values"])
+    return {mid: t for mid, t in agg.items() if any(t.values())}
+
+
+def error_stats(region, start, end, sess=None):
+    regions = regions_for(region)
+    sess = sess or DEFAULT_SESS
+    agg = {}
+    with ThreadPoolExecutor(max_workers=min(18, len(regions))) as ex:
+        futs = {ex.submit(region_errors, r, start, end, sess): r for r in regions}
+        for f in as_completed(futs):
+            try:
+                res = f.result()
+            except Exception:
+                continue
+            for mid, t in res.items():
+                a = agg.setdefault(mid, dict.fromkeys(ERROR_METRICS.values(), 0.0))
+                for k in ERROR_METRICS.values():
+                    a[k] += t[k]
+    rows = []
+    tc = ts = tt = tcalls = 0
+    for mid, t in agg.items():
+        calls, ce, se, th = int(t["calls"]), int(t["client"]), int(t["server"]), int(t["throttle"])
+        errs = ce + se + th
+        denom = calls + ce + se  # throttles 不算入分母(未进入计费/调用)
+        rows.append({"model": mid.split("anthropic.")[-1], "calls": calls,
+                     "client": ce, "server": se, "throttle": th,
+                     "errorRate": round((ce + se) / denom * 100, 2) if denom else 0.0})
+        tc += ce; ts += se; tt += th; tcalls += calls
+    rows.sort(key=lambda x: -(x["server"] + x["client"] + x["throttle"]))
+    return {"region": region, "start": start.strftime("%Y-%m-%d %H:%M"),
+            "end": end.strftime("%Y-%m-%d %H:%M"), "rows": rows,
+            "totals": {"calls": tcalls, "client": tc, "server": ts, "throttle": tt}}
+
+
 def logging_log_group(region, sess=None):
     """返回该区域已配置的调用日志 CloudWatch 日志组(用于前端自动选中)。"""
     sess = sess or DEFAULT_SESS
@@ -509,6 +584,8 @@ def lambda_handler(event, context):
             return _json(build_series(region, q["model"], start, end, session_for(account)))
         if fmt == "loggroup":
             return _json(logging_log_group(region, session_for(account)))
+        if fmt == "errors":
+            return _json(error_stats(region, start, end, session_for(account)))
         if fmt == "gray":
             if region in ("global", "all"):
                 return _json({"error": "灰区查询请选择具体区域(日志按区存储)"}, 400)
@@ -660,6 +737,25 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
   </div>
   <div class="cards" id="cards"></div>
   <div id="table"></div>
+  <div class="panel">
+    <div class="phead" onclick="toggleErr()">
+      <h3>🚨 错误监控 <span class="muted">· 基于 CloudWatch 指标 · 含 mantle 与历史</span></h3>
+      <span class="chev" id="errToggle">展开 ▾</span>
+    </div>
+    <div id="errWrap" style="display:none">
+      <div class="chartbar" style="margin:12px 0">
+        <button onclick="loadErr()">查询错误</button>
+        <span id="errMeta" class="muted"></span>
+      </div>
+      <div class="cards" id="errCards"></div>
+      <div id="errTable"></div>
+      <div class="muted" style="margin-top:12px;line-height:1.7">
+        用当前「账号/区域/日期」(支持 global 聚合)。指标覆盖 <b>runtime 与 mantle 两种端点</b>,
+        且不受"调用日志是否开启"影响——这里能看到灰区面板(仅 runtime 日志)看不到的 server error 等。
+        与灰区面板互补:此处看「有多少错」,灰区看「错的有没有计费 token」。
+      </div>
+    </div>
+  </div>
   <div class="panel">
     <div class="phead" onclick="toggleGray()">
       <h3>🩶 运行时灰区 <span class="muted">· 失败请求里已计费的 token · 仅 bedrock-runtime</span></h3>
@@ -818,6 +914,31 @@ function toggleGray(){
   w.style.display=open?'block':'none';
   document.getElementById('grayToggle').textContent=open?'收起 ▴':'展开 ▾';
   if(open) grayPickRegion();
+}
+function toggleErr(){
+  var w=document.getElementById('errWrap'),open=w.style.display==='none';
+  w.style.display=open?'block':'none';
+  document.getElementById('errToggle').textContent=open?'收起 ▴':'展开 ▾';
+}
+async function loadErr(){
+  const m=document.getElementById('errMeta');m.textContent='查询指标中…';
+  document.getElementById('errCards').innerHTML='';document.getElementById('errTable').innerHTML='';
+  try{
+    const d=await getJSON(`?format=errors&${qs()}`);
+    const t=d.totals;
+    m.textContent=`区域 ${d.region} · ${d.start}Z → ${d.end}Z`;
+    document.getElementById('errCards').innerHTML=`
+      <div class="card"><div class="k">成功调用</div><div class="v">${fmt(t.calls)}</div></div>
+      <div class="card"><div class="k">客户端错误 4xx</div><div class="v">${fmt(t.client)}</div></div>
+      <div class="card hl"><div class="k">服务端错误 5xx</div><div class="v">${fmt(t.server)}</div></div>
+      <div class="card"><div class="k">限流 429</div><div class="v">${fmt(t.throttle)}</div></div>`;
+    if(!d.rows.length){document.getElementById('errTable').innerHTML='<div class="loading">该窗口无数据</div>';return;}
+    document.getElementById('errTable').innerHTML=`<table>
+      <thead><tr><th>模型</th><th>成功调用</th><th>客户端4xx</th><th>服务端5xx</th><th>限流</th><th>错误率</th></tr></thead>
+      <tbody>${d.rows.map(r=>`<tr><td>${r.model}</td><td>${fmt(r.calls)}</td>
+        <td>${fmt(r.client)}</td><td><span class="${r.server>0?'cost':''}">${fmt(r.server)}</span></td>
+        <td>${fmt(r.throttle)}</td><td>${r.errorRate}%</td></tr>`).join('')}</tbody></table>`;
+  }catch(e){m.textContent='';document.getElementById('errTable').innerHTML=`<div class="err">查询失败: ${e.message}</div>`;}
 }
 async function grayPickRegion(){
   const region=document.getElementById('grayRegion').value;
