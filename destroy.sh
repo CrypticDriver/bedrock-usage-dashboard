@@ -1,36 +1,28 @@
 #!/usr/bin/env bash
-# 卸载 Bedrock Usage Dashboard 创建的所有资源
-set -uo pipefail
+# =============================================================================
+# 卸载 Bedrock Usage Dashboard(CloudFormation 栈)
+# 用法: ./destroy.sh          # REGION / STACK 可用环境变量覆盖
+# 说明: CloudFront 禁用+删除由栈自动处理,全程约 5-15 分钟。
+#       部署工件桶(cfn-deploy-*)保留不删,如需清理请手动删除。
+# =============================================================================
+set -euo pipefail
 REGION="${REGION:-us-west-2}"
-FUNC="${FUNC:-bedrock-dashboard}"
-ROLE="${ROLE:-bedrock-dashboard-role}"
-CF_FUNC="${CF_FUNC:-bedrock-dash-basicauth}"
-OAC_NAME="${OAC_NAME:-oac-bedrock-dashboard-lambda}"
-echo ">> 卸载中(区域 $REGION)…"
+STACK="${STACK:-bedrock-dashboard}"
 
-# CloudFront 必须先禁用再删除
-DID="$(aws cloudfront list-distributions --query "DistributionList.Items[?Comment=='Bedrock usage dashboard'].Id | [0]" --output text 2>/dev/null)"
-if [ -n "$DID" ] && [ "$DID" != "None" ]; then
-  ETAG="$(aws cloudfront get-distribution-config --id "$DID" --query ETag --output text)"
-  aws cloudfront get-distribution-config --id "$DID" --query DistributionConfig > /tmp/d.json
-  python3 -c "import json;d=json.load(open('/tmp/d.json'));d['Enabled']=False;json.dump(d,open('/tmp/d.json','w'))"
-  aws cloudfront update-distribution --id "$DID" --distribution-config file:///tmp/d.json --if-match "$ETAG" >/dev/null
-  echo ">> 已禁用 CloudFront $DID,等待部署完成后删除…"
-  aws cloudfront wait distribution-deployed --id "$DID"
-  ETAG="$(aws cloudfront get-distribution-config --id "$DID" --query ETag --output text)"
-  aws cloudfront delete-distribution --id "$DID" --if-match "$ETAG" && echo ">> 删除 CloudFront"
+if ! aws cloudformation describe-stacks --stack-name "$STACK" --region "$REGION" >/dev/null 2>&1; then
+  echo "栈 $STACK 不存在(区域 $REGION),无需卸载。"
+  echo "若是旧版散装部署(非 CFN),请用 git 历史里的 legacy destroy.sh 或手动清理:"
+  echo "  Lambda bedrock-dashboard / CloudFront(Comment='Bedrock usage dashboard')"
+  echo "  / CF Function bedrock-dash-basicauth / OAC oac-bedrock-dashboard-lambda"
+  echo "  / IAM role bedrock-dashboard-role / Secrets bedrock-dashboard/*"
+  exit 0
 fi
 
-aws lambda delete-function --function-name "$FUNC" --region "$REGION" 2>/dev/null && echo ">> 删除 Lambda" || true
-ET="$(aws cloudfront describe-function --name "$CF_FUNC" --query ETag --output text 2>/dev/null)"
-[ -n "${ET:-}" ] && aws cloudfront delete-function --name "$CF_FUNC" --if-match "$ET" && echo ">> 删除 CF Function" || true
-OAC="$(aws cloudfront list-origin-access-controls --query "OriginAccessControlList.Items[?Name=='$OAC_NAME'].Id | [0]" --output text 2>/dev/null)"
-if [ -n "$OAC" ] && [ "$OAC" != "None" ]; then
-  OE="$(aws cloudfront get-origin-access-control --id "$OAC" --query ETag --output text)"
-  aws cloudfront delete-origin-access-control --id "$OAC" --if-match "$OE" && echo ">> 删除 OAC" || true
-fi
-aws iam delete-role-policy --role-name "$ROLE" --policy-name dashboard-perms 2>/dev/null || true
-aws iam delete-role --role-name "$ROLE" 2>/dev/null && echo ">> 删除角色" || true
-echo ">> 密钥保留(如需删除): aws secretsmanager delete-secret --secret-id bedrock-dashboard/prices --region $REGION"
-echo ">> 各成员账号的 BedrockUsageReader 角色请单独删除"
-echo "✅ 卸载完成"
+read -r -p ">> 将删除栈 $STACK(区域 $REGION)及其全部资源,确认? [y/N] " ans
+[ "${ans:-}" = "y" ] || { echo "已取消"; exit 0; }
+
+aws cloudformation delete-stack --stack-name "$STACK" --region "$REGION"
+echo ">> 删除中(CloudFront 需先禁用,约 5-15 分钟)…"
+aws cloudformation wait stack-delete-complete --stack-name "$STACK" --region "$REGION" \
+  && echo "✅ 卸载完成" \
+  || { echo "❌ 删除未完成,查看: aws cloudformation describe-stack-events --stack-name $STACK --region $REGION"; exit 1; }

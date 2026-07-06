@@ -12,7 +12,8 @@
 - **🌍 区域与 global** — 单区域查询,或 `global` 跨所有已启用区域并发聚合(适配 `global.*` 跨区推理配置)
 - **🏢 多账号 / 跨 Org** — 中心 Lambda 通过 AssumeRole 读取其他账号的 CloudWatch;页面一键生成接入命令,粘到目标账号即纳管。**不依赖同一个 AWS Organization**
 - **⚙️ 单价可配置** — 单价存于 Secrets Manager,页面可视化编辑;支持「从 AWS Price List API 拉取」官方价
-- **🔎 应用推理配置自动解析** — 不透明的 application inference profile ID 自动反查底层基础模型来匹配单价
+- **🔎 三形态模型区分** — 直连模型 ID / 系统跨区 profile(`us.`/`global.`)/ application inference profile 在表格中清晰区分;app profile 自动反查显示 `名字 (底层模型)` 并匹配单价
+- **🔔 分账告警(钉钉)** — 只有 application inference profile 支持成本分配标签;EventBridge 定时(默认 6h)扫描,发现**直连模型 ID / 系统 profile 的用量**(无法分账)即推送钉钉 webhook(支持加签),页面可视化配置
 - **📅 UTC 对齐账单** — 按 UTC 天聚合,与 AWS 出账口径一致;支持日期范围与「千 token」账单口径单位切换
 - **🔐 登录鉴权** — CloudFront Function 实现 Basic Auth,边缘拦截,保护全站
 - **🧩 极简架构** — 单 Lambda + Function URL + CloudFront,无 S3 / 无 API Gateway / 无数据库
@@ -57,46 +58,30 @@ flowchart TD
 
 ## 🚀 一键部署
 
-前置:已配置 AWS 凭证。任选一种:
-
-### 方式 A — CloudFormation / SAM(推荐)
-
-整套资源由一个模板 `template.yaml` 创建。无需安装 SAM CLI,用 AWS CLI 即可(`cloudformation package` 会自动上传 Lambda 代码,SAM 变换由 CloudFormation 服务端处理):
+前置:已配置 AWS 凭证(需 aws cli v2 + python3)。**所有资源由 CloudFormation 栈统一管理**(便于变更/卸载,也不会被各类"资源清理"工具误删散装资源):
 
 ```bash
 git clone https://github.com/CrypticDriver/bedrock-usage-dashboard.git
 cd bedrock-usage-dashboard
 
-aws s3 mb s3://<你的部署桶>            # 已有桶可跳过
-aws cloudformation package \
-  --template-file template.yaml \
-  --s3-bucket <你的部署桶> \
-  --output-template-file packaged.yaml
-aws cloudformation deploy \
-  --template-file packaged.yaml \
-  --stack-name bedrock-dashboard \
-  --capabilities CAPABILITY_IAM \
-  --parameter-overrides DashUser=admin DashPass='你的密码'
-
-# 取看板地址
-aws cloudformation describe-stacks --stack-name bedrock-dashboard \
-  --query "Stacks[0].Outputs[?OutputKey=='DashboardURL'].OutputValue" --output text
+DASH_PASS='你的登录密码' ./deploy.sh
 ```
 
-装了 SAM CLI 的话更简单:`sam deploy --guided`(同一个 `template.yaml`)。
+脚本会自动:建部署桶(`cfn-deploy-<账号>-<区域>`)→ `cloudformation package` 上传代码 → 部署/更新栈 → 打印看板地址。
 
-卸载:`aws cloudformation delete-stack --stack-name bedrock-dashboard`
+可选环境变量:
 
-### 方式 B — Bash 脚本
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `REGION` | `us-west-2` | 部署区域 |
+| `STACK` | `bedrock-dashboard` | 栈名 |
+| `DASH_USER` / `DASH_PASS` | `admin` / — | 登录账密(首次必填 `DASH_PASS`,更新时省略=沿用) |
+| `ALERT_RATE` | `rate(6 hours)` | 分账告警定时频率,如 `rate(12 hours)` |
 
-```bash
-DASH_PASS='你的登录密码' ./deploy.sh      # 需 aws cli v2 / zip / python3
-```
-
-可选环境变量:`REGION`(默认 `us-west-2`)、`DASH_USER`、`DASH_PASS`。卸载:`./destroy.sh`。
-
-> 两种方式等价。CloudFormation 便于纳入 IaC / 变更管理;Bash 脚本零依赖、步骤直观。
-> 首次 CloudFront 分发约需 5–10 分钟。完成后用设置的用户名/密码登录。
+- **更新**:改完代码再跑一遍 `./deploy.sh` 即可(密码不用重给)。
+- **卸载**:`./destroy.sh`(删整个栈,CloudFront 禁用+删除全自动)。
+- 不想用脚本?`template.yaml` 就是标准 SAM 模板,`sam deploy --guided` 或手动 `package`+`deploy` 均可。
+- 首次 CloudFront 分发约需 5–10 分钟,完成后用设置的用户名/密码登录。
 
 ## 🏢 接入其他账号(跨 Org)
 
@@ -114,6 +99,15 @@ DASH_PASS='你的登录密码' ./deploy.sh      # 需 aws cli v2 / zip / python3
 - **⚙️ 配置 → 单价配置**:卡片式编辑每个家族/模型的单价(USD / 1M tokens),保存写入 Secrets Manager(约 1 分钟全量生效)
 - **🔄 从 AWS 定价 API 拉取**:调用 `pricing:GetProducts` 拉官方价作为参考(仅覆盖 AWS 已发布的模型)
 - 匹配优先级:完整 ModelId 精确 > 家族关键字(opus/sonnet/haiku/fable/nova)
+
+## 🔔 分账告警(钉钉)
+
+**场景**:只有 **application inference profile** 支持成本分配标签。一旦有人直接用模型 ID 或系统跨区 profile(`us.*` / `global.*`)调用,这部分费用就无法按业务分账——很多客户对此零容忍。
+
+- 打开看板 → **⚙️ 配置 → 🔔 分账告警**:填钉钉机器人 webhook(安全设置建议「加签」,或自定义关键词含 `Bedrock`)、检查窗口(6/12/24h)、区域,勾选「启用」保存
+- **EventBridge 定时触发**(部署参数 `ALERT_RATE` 可调):窗口内发现不可分账用量 → 推送 markdown 告警(模型、token 量、估算金额、整改建议)
+- **🧪 立即检查并推送**:异步后台执行(全区域扫描约 1 分钟),结果直接推钉钉
+- 配置存于 Secrets Manager `<栈名>/alerts`
 
 ## 🩶 运行时"灰区"统计(看板内置面板)
 
