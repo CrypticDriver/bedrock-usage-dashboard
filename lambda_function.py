@@ -340,21 +340,39 @@ def run_alert_check(cfg=None, force_send=False):
     if force_send and not bad and cfg.get("webhook"):
         should_send = True  # 手动测试时没命中也推一条,便于验证 webhook 通不通
     if should_send:
-        lines = [f"### ⚠️ Bedrock 未分账用量告警",
-                 f"近 **{hours}h**({result['start']}–{result['end']} UTC, 区域 {result['region']}) "
-                 f"存在**未走 application inference profile** 的调用,无法按标签分账:", ""]
+        def _tok(n):
+            if n >= 1_000_000:
+                return f"{n / 1e6:.1f}M"
+            if n >= 1_000:
+                return f"{n / 1e3:.1f}K"
+            return str(n)
+
+        def _label(name):
+            for p in ("global.", "us.", "eu.", "apac.", "jp.", "au.", "ca.", "sa."):
+                if name.startswith(p):
+                    return name[len(p):].replace("anthropic.", ""), f"{p[:-1]} 跨区 profile"
+            return name.replace("anthropic.", ""), "直连模型 ID"
+
+        blocks = ["## 🚨 Bedrock 分账告警",
+                  f"**近 {hours} 小时**（{result['start']} – {result['end']} UTC · {result['region']}）"]
         if bad:
-            for r in bad[:15]:
-                lines.append(f"- **{r['model']}** in {r['in']:,} / out {r['out']:,} ≈ ${r['cost']}")
-            if len(bad) > 15:
-                lines.append(f"- …等共 {len(bad)} 个模型")
-            lines += ["", f"**合计 ≈ ${total_bad}**", "",
-                      "> 建议:为每个应用创建 application inference profile,调用时改用其 ARN。"]
+            blocks.append(f"共 **{len(bad)}** 个模型未走 app inference profile，"
+                          f"**≈ ${total_bad}** 无法按标签分账：")
+            items = []
+            for i, r in enumerate(bad[:10], 1):
+                name, kind = _label(r["model"])
+                items.append(f"**{i}. {name}** — **${r['cost']}**\n"
+                             f"&nbsp;&nbsp;&nbsp;&nbsp;{kind} · in {_tok(r['in'])} · out {_tok(r['out'])}")
+            if len(bad) > 10:
+                items.append(f"…等共 {len(bad)} 个模型")
+            blocks.append("\n\n".join(items))
+            blocks.append("> 💡 为每个应用创建 **application inference profile**，"
+                          "调用时改用其 ARN，费用即可按标签分账。")
         else:
-            lines.append("(测试消息:当前窗口内未发现未分账用量 ✅)")
+            blocks.append("✅ 测试消息：当前窗口内未发现未分账用量。")
         try:
             resp = dingtalk_send(cfg["webhook"], cfg.get("sign_secret", ""),
-                                 "Bedrock 用量告警", "\n".join(lines))
+                                 "Bedrock 分账告警", "\n\n".join(blocks))
             if resp.get("errcode") == 0:
                 result["sent"] = True
             else:
