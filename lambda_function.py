@@ -202,8 +202,11 @@ def underlying_model(regions, model_id, sess=None):
     if model_id in _profile_cache:
         return _profile_cache[model_id]
     pid = model_id.split("/")[-1] if model_id.startswith("arn:") else model_id
+    # 优先试常用区，避免 global 视图按字母序把几十个区都试一遍拖死 Lambda
+    preferred = [r for r in ("us-east-1", "us-west-2", "us-east-2", "eu-west-1") if r in regions]
+    ordered = preferred + [r for r in regions if r not in preferred]
     fm = None
-    for r in regions:
+    for r in ordered:
         try:
             resp = sess.client("bedrock", region_name=r, config=FAST).get_inference_profile(
                 inferenceProfileIdentifier=pid)
@@ -229,9 +232,12 @@ def display_model(mid, regions, sess=None):
     is_arn = mid.startswith("arn:")
     if not is_arn and not mid.startswith(PROFILE_ID_PREFIXES):
         return short_model(mid)  # 直调 foundation model
-    pid = mid.split("/")[-1] if is_arn else mid
-    fm = underlying_model(regions, mid, sess)
-    if fm and short_model(fm) not in (pid, short_model(pid)):
+    if not is_arn:
+        # 系统跨区 profile：id 本身已含模型名，无需 API 反查（global 视图下反查会拖慢）
+        return mid
+    pid = mid.split("/")[-1]
+    fm = underlying_model(regions, mid, sess)  # application profile：ARN 看不出模型，反查
+    if fm:
         return f"{pid} ({short_model(fm)})"
     return pid
 
