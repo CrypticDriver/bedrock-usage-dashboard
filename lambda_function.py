@@ -217,6 +217,25 @@ def underlying_model(regions, model_id, sess=None):
     return fm
 
 
+PROFILE_ID_PREFIXES = ("us.", "eu.", "apac.", "jp.", "au.", "ca.", "sa.", "global.")
+
+
+def short_model(mid):
+    return mid.split("anthropic.")[-1]
+
+
+def display_model(mid, regions, sess=None):
+    """直调模型显示模型名；inference profile 显示 profile_id (底层模型名)。"""
+    is_arn = mid.startswith("arn:")
+    if not is_arn and not mid.startswith(PROFILE_ID_PREFIXES):
+        return short_model(mid)  # 直调 foundation model
+    pid = mid.split("/")[-1] if is_arn else mid
+    fm = underlying_model(regions, mid, sess)
+    if fm and short_model(fm) not in (pid, short_model(pid)):
+        return f"{pid} ({short_model(fm)})"
+    return pid
+
+
 def price_for(model_id, regions, sess=None):
     """返回 (price_dict_or_None, source_label)。含应用配置反查。"""
     table, psource = load_prices()
@@ -331,7 +350,7 @@ def build_data(region, start, end, sess=None):
         price, src = price_for(mid, regions, sess)
         cost = sum(t[k] / 1e6 * price[k] for k in METRICS.values()) if price else 0.0
         total += cost
-        rows.append({"id": mid, "model": mid.split("anthropic.")[-1],
+        rows.append({"id": mid, "model": display_model(mid, regions, sess),
                      "in": int(t["in"]), "out": int(t["out"]),
                      "cache_read": int(t["cache_read"]), "cache_write": int(t["cache_write"]),
                      "cost": round(cost, 2), "price": src})
@@ -366,7 +385,7 @@ def build_series(region, model_id, start, end, sess=None):
         points.append({"date": d, "cost": round(cost, 4),
                        "in": int(t["in"]), "out": int(t["out"]),
                        "cache_read": int(t["cache_read"]), "cache_write": int(t["cache_write"])})
-    return {"region": region, "model": model_id.split("anthropic.")[-1], "id": model_id,
+    return {"region": region, "model": display_model(model_id, regions, sess), "id": model_id,
             "price": src, "points": points, "total": round(sum(p["cost"] for p in points), 2),
             "estimate": True}
 
