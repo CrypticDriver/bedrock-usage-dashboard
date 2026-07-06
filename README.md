@@ -31,15 +31,19 @@
 
 ```mermaid
 flowchart TD
-  U["👤 用户浏览器"] -->|"HTTPS + Basic Auth"| CF["CloudFront Distribution<br/>(CloudFront Function:<br/>viewer-request Basic Auth)"]
+  U["用户浏览器"] -->|"HTTPS + Basic Auth"| CF["CloudFront Distribution<br/>(CloudFront Function:<br/>viewer-request Basic Auth)"]
   CF -->|"OAC · SigV4 签名"| FURL["Lambda Function URL<br/>AuthType = AWS_IAM(非公开)"]
 
   subgraph CENTRAL["中心账号"]
     FURL --> L["Lambda · bedrock-dashboard<br/>HTML 页面 + JSON API"]
+    EB["EventBridge<br/>rate(6 hours)"] -->|"定时: 分账检查<br/>+ 刷新快照"| L
     L -->|"读 token 指标"| CW["CloudWatch<br/>AWS/Bedrock"]
-    L -->|"单价 / 账号注册表"| SM["Secrets Manager<br/>prices · accounts"]
+    L -->|"单价 / 账号 / 告警配置"| SM["Secrets Manager<br/>prices · accounts · alerts"]
+    L <-->|"7天 global 快照<br/>(页面秒开)"| S3["S3 缓存桶<br/>私有 · 7天生命周期"]
     L -.->|"可选: 官方单价"| PR["AWS Price List API"]
   end
+
+  L -->|"发现非 app profile 用量<br/>(无法分账)"| DT["钉钉 webhook<br/>markdown 告警 · 可加签"]
 
   L -->|"sts:AssumeRole + ExternalId"| RR
   subgraph ORG["其他账号(可跨 Organization)"]
