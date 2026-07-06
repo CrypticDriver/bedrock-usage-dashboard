@@ -232,7 +232,7 @@ def resolve_price(model_id, table):
 
 
 def profile_info(regions, model_id, sess=None):
-    """反查 inference profile。返回 (profile名, 底层模型id) 或 (None, None)。"""
+    """反查 inference profile。返回 (profile名, 底层模型id, arn) 或 (None, None, None)。"""
     sess = sess or DEFAULT_SESS
     if model_id in _profile_cache:
         return _profile_cache[model_id]
@@ -240,14 +240,14 @@ def profile_info(regions, model_id, sess=None):
     # 优先试常用区，避免 global 视图按字母序把几十个区都试一遍拖死 Lambda
     preferred = [r for r in ("us-west-2", "us-east-1", "us-east-2", "eu-west-1") if r in regions]
     ordered = preferred + [r for r in regions if r not in preferred]
-    info = (None, None)
+    info = (None, None, None)
     for r in ordered:
         try:
             resp = sess.client("bedrock", region_name=r, config=FAST).get_inference_profile(
                 inferenceProfileIdentifier=pid)
             models = resp.get("models", [])
             fm = models[0]["modelArn"].split("/")[-1] if models else None
-            info = (resp.get("inferenceProfileName"), fm)
+            info = (resp.get("inferenceProfileName"), fm, resp.get("inferenceProfileArn"))
             break
         except Exception:
             continue
@@ -277,7 +277,7 @@ def display_model(mid, regions, sess=None):
             return short_model(mid)  # 直调 foundation model（vendor.model 必含点号）
     # application inference profile：ARN 或无点号裸 id（如 ej8uoudeuci1）
     pid = mid.split("/")[-1] if mid.startswith("arn:") else mid
-    name, fm = profile_info(regions, mid, sess)
+    name, fm, _ = profile_info(regions, mid, sess)
     label = name or pid
     if fm:
         return f"{label} ({short_model(fm)})"
@@ -515,7 +515,16 @@ def build_data(region, start, end, sess=None):
         price, src = price_for(mid, regions, sess)
         cost = sum(t[k] / 1e6 * price[k] for k in METRICS.values()) if price else 0.0
         total += cost
+        taggable = is_taggable_profile(mid)
+        arn = ""
+        kind = "模型 ID"
+        if taggable:
+            arn = profile_info(regions, mid, sess)[2] or (mid if mid.startswith("arn:") else "")
+            kind = "应用推理 profile"
+        elif mid.startswith(PROFILE_ID_PREFIXES):
+            kind = "系统跨区 profile"
         rows.append({"id": mid, "model": display_model(mid, regions, sess),
+                     "kind": kind, "arn": arn, "taggable": taggable,
                      "in": int(t["in"]), "out": int(t["out"]),
                      "cache_read": int(t["cache_read"]), "cache_write": int(t["cache_write"]),
                      "cost": round(cost, 2), "price": src})
@@ -710,6 +719,8 @@ def _json(obj, code=200):
 
 
 def lambda_handler(event, context):
+    if isinstance(event, dict) and not event.get("queryStringParameters") and event.get("action") == "refresh_cache":
+        return {"cache_refreshed": write_snapshot_cache()}
     if isinstance(event, dict) and not event.get("queryStringParameters") and (
             event.get("action") == "alert_check" or event.get("source") == "aws.events"):
         result = run_alert_check(force_send=bool(event.get("force")))
@@ -873,6 +884,8 @@ tr{border-top:1px solid rgba(255,255,255,.07)}
 tbody tr:hover{background:rgba(255,255,255,.04)}
 .cost{color:#34d399;font-weight:600}
 .pill{font-size:11px;color:#9aa3c7;background:rgba(255,255,255,.06);padding:2px 8px;border-radius:999px}
+.pill.ok{color:#34d399;background:rgba(52,211,153,.1);border:1px solid rgba(52,211,153,.3)}
+.pill.warn{color:#fbbf24;background:rgba(251,191,36,.08);border:1px solid rgba(251,191,36,.3)}
 .unknown{color:#fb7185}
 .foot{color:#6b7494;font-size:12px;margin-top:18px;line-height:1.6}
 .loading{color:#8b94b8;padding:40px;text-align:center}
@@ -1140,13 +1153,15 @@ function renderMain(){
     <div class="card"><div class="k">输出 tokens</div><div class="v">${tok(tOut)}</div></div>
     <div class="card"><div class="k">模型数</div><div class="v">${d.rows.length}</div></div>`;
   document.getElementById('table').innerHTML=`${d.cached_at?`<div class="muted" style="margin:0 0 10px">📸 快照数据 · 生成于 ${d.cached_at} UTC · 点「🔍 查询估算」获取实时</div>`:''}<table>
-    <thead><tr><th>模型</th><th>输入</th><th>输出</th><th>缓存读</th><th>缓存写</th><th>估算成本</th><th>单价来源</th></tr></thead>
+    <thead><tr><th>模型</th><th>类型</th><th>输入</th><th>输出</th><th>缓存读</th><th>缓存写</th><th>估算成本</th><th>单价来源</th></tr></thead>
     <tbody>${d.rows.map(x=>`<tr>
-      <td>${x.model}</td><td>${tok(x.in)}</td><td>${tok(x.out)}</td>
+      <td title="${x.id}">${x.model}</td>
+      <td style="text-align:left"><span class="pill ${x.taggable?'ok':'warn'}" title="${x.taggable?(x.arn||x.id):'不可按标签分账'}">${x.kind||''}</span></td>
+      <td>${tok(x.in)}</td><td>${tok(x.out)}</td>
       <td>${tok(x.cache_read)}</td><td>${tok(x.cache_write)}</td>
       <td class="cost">≈ $${fmt(x.cost)}</td>
       <td><span class="pill ${x.price==='UNKNOWN'?'unknown':''}">${x.price}</span></td></tr>`).join('')
-      ||'<tr><td colspan=7 style="text-align:center;color:#8b94b8">该窗口无用量</td></tr>'}</tbody></table>`;
+      ||'<tr><td colspan=8 style="text-align:center;color:#8b94b8">该窗口无用量</td></tr>'}</tbody></table>`;
 }
 function pick(id){document.getElementById('seriesModel').value=id;drawSeries();
   document.getElementById('chart').scrollIntoView({behavior:'smooth',block:'center'});}
