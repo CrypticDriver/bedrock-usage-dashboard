@@ -12,6 +12,8 @@ import json
 import time
 import datetime as dt
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
 import boto3
 from botocore.config import Config
 
@@ -28,6 +30,10 @@ ENABLE_OPS_PANELS = os.environ.get("ENABLE_OPS_PANELS", "").lower() in ("1", "tr
 CACHE_BUCKET = os.environ.get("CACHE_BUCKET", "")
 CACHE_KEY = "cache/global-7d.json"
 CACHE_MAX_AGE_SEC = 8 * 3600  # 定时任务每6h刷一次,超8h视为过期
+try:
+    DASH_VERSION = (Path(__file__).parent / "VERSION").read_text().strip()
+except Exception:
+    DASH_VERSION = "dev"
 
 
 def write_snapshot_cache():
@@ -819,7 +825,7 @@ def lambda_handler(event, context):
             return _json(gray_area(region, lg, start, end, session_for(account)))
     except Exception as e:
         return _json({"error": str(e)}, 500)
-    page = HTML
+    page = HTML.replace("__DASH_VERSION__", DASH_VERSION)
     if not ENABLE_OPS_PANELS:
         start = page.find("<!--OPS_PANELS_START-->")
         end = page.find("<!--OPS_PANELS_END-->")
@@ -1099,7 +1105,7 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
     </div>
   </div>
   </div>
-  <div class="foot">
+  <div class="foot">v__DASH_VERSION__ · <a href="https://github.com/CrypticDriver/bedrock-usage-dashboard" style="color:#8b94b8">GitHub / 更新指南</a><br/>
     数据源 CloudWatch AWS/Bedrock(Sum),按 <b>UTC 天</b>聚合(与 AWS 账单口径一致)。global 会扫描所有已启用区域并聚合。
     <br/><b>对账提示:</b>看板默认显示<b>原始 token 数</b>;AWS 账单 UsageQuantity 单位是<b>千 token</b>(= 看板数 ÷ 1000),切换上方「数量单位」即可对齐。
     账单里 cache-write 分 5min / 1h 两条,二者<b>之和</b> = 看板的 cacheW。

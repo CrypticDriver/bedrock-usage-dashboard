@@ -95,6 +95,20 @@ DASH_PASS='你的登录密码' ./deploy.sh
 - 不想用脚本?`template.yaml` 就是标准 SAM 模板,`sam deploy --guided` 或手动 `package`+`deploy` 均可。
 - 首次 CloudFront 分发约需 5–10 分钟,完成后用设置的用户名/密码登录。
 
+## 🔄 已部署客户如何更新
+
+配置数据(单价 / 账号注册表 / 告警配置 / 登录密码)都存在 Secrets Manager 与 CloudFormation 参数里,**更新代码不会丢**:
+
+```bash
+cd bedrock-usage-dashboard
+git pull
+./deploy.sh          # 密码不用重给,沿用原值;栈增量更新,页面无感切换
+```
+
+- 当前版本看**页面页脚**(如 `v1.1.0`),变更内容见 [CHANGELOG.md](CHANGELOG.md)
+- 模板新增的资源(如缓存桶/定时规则)会由栈自动创建;删除的资源自动清理
+- 想固定版本:`git checkout v1.1.0` 后再 `./deploy.sh`(建议按 tag 发布节奏更新)
+
 ## 🏢 接入其他账号(跨 Org)
 
 1. 打开看板 → **⚙️ 配置 → 多账号接入** → 点 **🎲 生成接入命令**

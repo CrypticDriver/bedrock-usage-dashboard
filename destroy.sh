@@ -21,8 +21,17 @@ fi
 read -r -p ">> 将删除栈 $STACK(区域 $REGION)及其全部资源,确认? [y/N] " ans
 [ "${ans:-}" = "y" ] || { echo "已取消"; exit 0; }
 
+# S3 桶非空会导致删栈失败 → 先清空缓存桶
+ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+CACHE_BUCKET="${STACK}-cache-${ACCOUNT_ID}"
+aws s3 rm "s3://$CACHE_BUCKET" --recursive >/dev/null 2>&1 && echo ">> 已清空缓存桶 $CACHE_BUCKET" || true
+
 aws cloudformation delete-stack --stack-name "$STACK" --region "$REGION"
 echo ">> 删除中(CloudFront 需先禁用,约 5-15 分钟)…"
 aws cloudformation wait stack-delete-complete --stack-name "$STACK" --region "$REGION" \
-  && echo "✅ 卸载完成" \
+  && { echo "✅ 卸载完成";
+       # secrets 若进入回收期会阻碍同名重建,兜底强删(已删则静默跳过)
+       for sec in prices accounts alerts; do
+         aws secretsmanager delete-secret --secret-id "$STACK/$sec" --force-delete-without-recovery --region "$REGION" >/dev/null 2>&1 || true
+       done; } \
   || { echo "❌ 删除未完成,查看: aws cloudformation describe-stack-events --stack-name $STACK --region $REGION"; exit 1; }

@@ -6,7 +6,7 @@ Description: >
 Parameters:
   CentralRoleArn:
     Type: String
-    Default: arn:aws:iam::CENTRAL_ACCOUNT_ID:role/bedrock-dashboard-role
+    Default: arn:aws:iam::CENTRAL_ACCOUNT_ID:role/CENTRAL_DASHBOARD_ROLE_NAME
     Description: 中心看板 Lambda 的角色 ARN(允许它 assume 本角色)
   ExternalId:
     Type: String
