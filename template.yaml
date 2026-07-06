@@ -47,6 +47,21 @@ Resources:
       Description: DingTalk webhook config for untagged-usage alerts
       SecretString: '{"webhook":"","sign_secret":"","window_hours":6,"region":"global","enabled":false}'
 
+  CacheBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-cache-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-cache
+            Status: Enabled
+            ExpirationInDays: 7
+
   DashboardRole:
     Type: AWS::IAM::Role
     Properties:
@@ -76,6 +91,12 @@ Resources:
                   - logs:StopQuery
                   - logs:DescribeLogGroups
                 Resource: '*'
+              - Sid: Cache
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub "${CacheBucket.Arn}/*"
               - Sid: SelfInvoke
                 Effect: Allow
                 Action: lambda:InvokeFunction
@@ -117,6 +138,7 @@ Resources:
           ACCOUNTS_SECRET: !Ref AccountsSecret
           ALERTS_SECRET: !Ref AlertsSecret
           ENABLE_OPS_PANELS: !Ref EnableOpsPanels
+          CACHE_BUCKET: !Ref CacheBucket
 
   FunctionUrl:
     Type: AWS::Lambda::Url
@@ -162,6 +184,7 @@ Resources:
               HTTPPort: 80
               HTTPSPort: 443
               OriginProtocolPolicy: https-only
+              OriginReadTimeout: 60
               OriginSSLProtocols: [TLSv1.2]
         DefaultCacheBehavior:
           TargetOriginId: lambda-origin

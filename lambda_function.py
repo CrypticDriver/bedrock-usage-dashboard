@@ -25,6 +25,37 @@ ACCOUNTS_SECRET = os.environ.get("ACCOUNTS_SECRET", "bedrock-dashboard/accounts"
 ALERTS_SECRET = os.environ.get("ALERTS_SECRET", "bedrock-dashboard/alerts")
 # 运维深水区面板(错误监控/运行时灰区)默认关闭,精简部署;要开在 CFN 参数 EnableOpsPanels=true
 ENABLE_OPS_PANELS = os.environ.get("ENABLE_OPS_PANELS", "").lower() in ("1", "true", "yes")
+CACHE_BUCKET = os.environ.get("CACHE_BUCKET", "")
+CACHE_KEY = "cache/global-7d.json"
+CACHE_MAX_AGE_SEC = 8 * 3600  # 定时任务每6h刷一次,超8h视为过期
+
+
+def write_snapshot_cache():
+    """告警定时任务顺手刷新 7 天 global 快照,页面秒开。"""
+    if not CACHE_BUCKET:
+        return False
+    end = dt.datetime.now(dt.UTC)
+    start = end - dt.timedelta(days=7)
+    data = build_data("global", start, end)
+    data["cached_at"] = end.strftime("%Y-%m-%d %H:%M")
+    boto3.client("s3", region_name=LAMBDA_REGION).put_object(
+        Bucket=CACHE_BUCKET, Key=CACHE_KEY,
+        Body=json.dumps(data).encode(), ContentType="application/json")
+    return True
+
+
+def read_snapshot_cache():
+    if not CACHE_BUCKET:
+        return None
+    try:
+        s3 = boto3.client("s3", region_name=LAMBDA_REGION)
+        obj = s3.get_object(Bucket=CACHE_BUCKET, Key=CACHE_KEY)
+        age = (dt.datetime.now(dt.UTC) - obj["LastModified"]).total_seconds()
+        if age > CACHE_MAX_AGE_SEC:
+            return None
+        return json.loads(obj["Body"].read())
+    except Exception:
+        return None
 EDIT_KEY = os.environ.get("EDIT_KEY", "")
 PRICE_TTL = 60  # 单价缓存秒数
 DEFAULT_SESS = boto3.Session()  # 中心账号默认会话
@@ -684,6 +715,10 @@ def lambda_handler(event, context):
         result = run_alert_check(force_send=bool(event.get("force")))
         print(json.dumps({"alert_check": {k: v for k, v in result.items() if k != "violations"},
                           "violation_count": len(result.get("violations", []))}, ensure_ascii=False))
+        try:
+            result["cache_refreshed"] = write_snapshot_cache()
+        except Exception as e:
+            print(f"cache refresh failed: {e}")
         return result
     q = (event.get("queryStringParameters") or {}) if isinstance(event, dict) else {}
     q = q or {}
@@ -753,6 +788,10 @@ def lambda_handler(event, context):
                 return _json({"error": str(e)}, 400)
             return _json({"ok": True, "prices": clean})
         if fmt == "json":
+            if q.get("cached") == "1" and region == "global" and not account:
+                snap = read_snapshot_cache()
+                if snap:
+                    return _json(snap)
             return _json(build_data(region, start, end, session_for(account)))
         if fmt == "series":
             if not q.get("model"):
@@ -911,7 +950,7 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
         <option value="1">原始 token</option>
         <option value="1000">千 token(账单口径)</option>
       </select></div>
-    <button class="primary" onclick="load()">🔍 查询估算</button>
+    <button class="primary" onclick="window.__live=1;load()">🔍 查询估算</button>
   </div>
   <div class="cards" id="cards"></div>
   <div id="table"></div>
@@ -1078,7 +1117,7 @@ async function load(){
   document.getElementById('cards').innerHTML='';
   document.getElementById('table').innerHTML='<div class="loading">⏳ 正在查询 CloudWatch…</div>';
   try{
-    const d=await getJSON(`?format=json&${qs()}`);
+    const d=await getJSON(`?format=json&${qs()}${window.__live?'':'&cached=1'}`);
     window._d=d;
     renderMain();
   }catch(e){
@@ -1100,7 +1139,7 @@ function renderMain(){
     <div class="card"><div class="k">输入+缓存 tokens</div><div class="v">${tok(tIn)}</div></div>
     <div class="card"><div class="k">输出 tokens</div><div class="v">${tok(tOut)}</div></div>
     <div class="card"><div class="k">模型数</div><div class="v">${d.rows.length}</div></div>`;
-  document.getElementById('table').innerHTML=`<table>
+  document.getElementById('table').innerHTML=`${d.cached_at?`<div class="muted" style="margin:0 0 10px">📸 快照数据 · 生成于 ${d.cached_at} UTC · 点「🔍 查询估算」获取实时</div>`:''}<table>
     <thead><tr><th>模型</th><th>输入</th><th>输出</th><th>缓存读</th><th>缓存写</th><th>估算成本</th><th>单价来源</th></tr></thead>
     <tbody>${d.rows.map(x=>`<tr>
       <td>${x.model}</td><td>${tok(x.in)}</td><td>${tok(x.out)}</td>
