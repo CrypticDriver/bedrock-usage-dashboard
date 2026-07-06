@@ -661,7 +661,10 @@ def _json(obj, code=200):
 def lambda_handler(event, context):
     if isinstance(event, dict) and not event.get("queryStringParameters") and (
             event.get("action") == "alert_check" or event.get("source") == "aws.events"):
-        return run_alert_check()
+        result = run_alert_check(force_send=bool(event.get("force")))
+        print(json.dumps({"alert_check": {k: v for k, v in result.items() if k != "violations"},
+                          "violation_count": len(result.get("violations", []))}, ensure_ascii=False))
+        return result
     q = (event.get("queryStringParameters") or {}) if isinstance(event, dict) else {}
     q = q or {}
     region = q.get("region", "us-west-2")
@@ -709,7 +712,10 @@ def lambda_handler(event, context):
         if q.get("action") == "test_alert":
             if EDIT_KEY and q.get("key") != EDIT_KEY:
                 return _json({"error": "编辑密钥无效"}, 403)
-            return _json(run_alert_check(force_send=True))
+            lam = boto3.client("lambda", region_name=LAMBDA_REGION)
+            lam.invoke(FunctionName=context.function_name, InvocationType="Event",
+                       Payload=json.dumps({"action": "alert_check", "force": True}).encode())
+            return _json({"ok": True, "queued": True})
         if fmt == "pricelist":
             pr = fetch_price_list(region if region not in ("global", "all") else "us-east-1")
             return _json({"prices": pr, "source": "AWS Price List API",
@@ -1198,16 +1204,11 @@ async function testAlert(){
   m.textContent='💾 先保存配置…';
   await saveAlerts();
   if(m.textContent.startsWith('❌'))return;
-  m.textContent='🧪 检查中(全区域约1分钟)…';
+  m.textContent='🧪 触发后台检查…';
   try{
     const d=await getJSON('?action=test_alert&key=');
     if(d.error)throw new Error(d.error);
-    const n=(d.violations||[]).length;
-    let msg=`发现 ${n} 个未分账模型,合计 ≈ $${d.violation_cost}`;
-    if(d.sent)msg+=' · 已推送钉钉 ✅';
-    else if(d.send_error)msg+=' · 推送失败: '+d.send_error;
-    else msg+=' · 未配置 webhook,未推送';
-    m.textContent=msg;
+    m.textContent='✅ 已触发,约 1 分钟内结果推送到钉钉(未配 webhook 则不推)';
   }catch(e){m.textContent='❌ '+e.message;}
 }
 function toggleView(){

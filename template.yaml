@@ -71,6 +71,10 @@ Resources:
                   - logs:StopQuery
                   - logs:DescribeLogGroups
                 Resource: '*'
+              - Sid: SelfInvoke
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}"
               - Sid: AssumeReaders
                 Effect: Allow
                 Action: sts:AssumeRole
