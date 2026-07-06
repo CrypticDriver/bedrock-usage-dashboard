@@ -891,6 +891,10 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
 .loading{color:#8b94b8;padding:40px;text-align:center}
 .err{color:#fb7185;padding:20px;background:rgba(251,113,133,.08);border-radius:12px}
 .muted{color:#8b94b8;font-size:12px}
+#tip{position:fixed;z-index:99;pointer-events:none;display:none;max-width:640px;
+  background:#141a2e;border:1px solid rgba(165,180,252,.4);color:#cdd6ff;border-radius:8px;
+  padding:7px 12px;font-size:12px;font-family:ui-monospace,Menlo,Consolas,monospace;
+  box-shadow:0 8px 24px rgba(0,0,0,.5);word-break:break-all}
 .phead{display:flex;justify-content:space-between;align-items:center;cursor:pointer;user-select:none}
 .phead h3{margin:0}
 .chev{font-size:13px;color:#a5b4fc;font-weight:600}
@@ -935,6 +939,7 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
   white-space:pre-wrap;word-break:break-all;line-height:1.7;max-height:300px;overflow:auto;margin:10px 0}
 </style></head>
 <body>
+<div id="tip"></div>
 <div class="bg"><span class="b1"></span><span class="b2"></span><span class="b3"></span></div>
 <div class="wrap">
   <h1>✦ Bedrock 用量 & 成本估算看板</h1>
@@ -1154,7 +1159,7 @@ function renderMain(){
     <div class="card"><div class="k">模型数</div><div class="v">${d.rows.length}</div></div>`;
   document.getElementById('table').innerHTML=`${d.cached_at?`<div class="muted" style="margin:0 0 10px">📸 快照数据 · 生成于 ${d.cached_at} UTC · 点「🔍 查询估算」获取实时</div>`:''}<table>
     <thead><tr><th>模型</th><th>类型</th><th>输入</th><th>输出</th><th>缓存读</th><th>缓存写</th><th>估算成本</th></tr></thead>
-    <tbody>${d.rows.map(x=>`<tr title="${x.arn||x.id}">
+    <tbody>${d.rows.map(x=>`<tr data-tip="${x.arn||x.id}">
       <td>${x.model}</td>
       <td style="text-align:left"><span class="pill ${x.taggable?'ok':'warn'}" title="${x.taggable?(x.arn||x.id):'不可按标签分账'}">${x.kind||''}</span></td>
       <td>${tok(x.in)}</td><td>${tok(x.out)}</td>
@@ -1290,6 +1295,19 @@ async function testAlert(){
     m.textContent='✅ 已触发,约 1 分钟内结果推送到钉钉(未配 webhook 则不推)';
   }catch(e){m.textContent='❌ '+e.message;}
 }
+const _tip=()=>document.getElementById('tip');
+document.addEventListener('mouseover',e=>{
+  const tr=e.target.closest&&e.target.closest('tr[data-tip]');
+  const t=_tip();
+  t.style.display = tr ? 'block' : 'none';
+  t.textContent = tr ? tr.getAttribute('data-tip') : '';
+});
+document.addEventListener('mousemove',e=>{
+  const t=_tip();
+  const on = t.style.display==='block';
+  t.style.left = on ? Math.min(e.clientX+14, window.innerWidth-t.offsetWidth-10)+'px' : t.style.left;
+  t.style.top = on ? Math.min(e.clientY+16, window.innerHeight-t.offsetHeight-10)+'px' : t.style.top;
+});
 function toggleView(){
   var m=document.getElementById('mainView'),c=document.getElementById('configView'),b=document.getElementById('navBtn');
   var showCfg=c.style.display==='none';
