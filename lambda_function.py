@@ -197,27 +197,32 @@ def resolve_price(model_id, table):
     return None, None
 
 
-def underlying_model(regions, model_id, sess=None):
+def profile_info(regions, model_id, sess=None):
+    """反查 inference profile。返回 (profile名, 底层模型id) 或 (None, None)。"""
     sess = sess or DEFAULT_SESS
     if model_id in _profile_cache:
         return _profile_cache[model_id]
     pid = model_id.split("/")[-1] if model_id.startswith("arn:") else model_id
     # 优先试常用区，避免 global 视图按字母序把几十个区都试一遍拖死 Lambda
-    preferred = [r for r in ("us-east-1", "us-west-2", "us-east-2", "eu-west-1") if r in regions]
+    preferred = [r for r in ("us-west-2", "us-east-1", "us-east-2", "eu-west-1") if r in regions]
     ordered = preferred + [r for r in regions if r not in preferred]
-    fm = None
+    info = (None, None)
     for r in ordered:
         try:
             resp = sess.client("bedrock", region_name=r, config=FAST).get_inference_profile(
                 inferenceProfileIdentifier=pid)
             models = resp.get("models", [])
-            if models:
-                fm = models[0]["modelArn"].split("/")[-1]
-                break
+            fm = models[0]["modelArn"].split("/")[-1] if models else None
+            info = (resp.get("inferenceProfileName"), fm)
+            break
         except Exception:
             continue
-    _profile_cache[model_id] = fm
-    return fm
+    _profile_cache[model_id] = info
+    return info
+
+
+def underlying_model(regions, model_id, sess=None):
+    return profile_info(regions, model_id, sess)[1]
 
 
 PROFILE_ID_PREFIXES = ("us.", "eu.", "apac.", "jp.", "au.", "ca.", "sa.", "global.")
@@ -228,18 +233,21 @@ def short_model(mid):
 
 
 def display_model(mid, regions, sess=None):
-    """直调模型显示模型名；inference profile 显示 profile_id (底层模型名)。"""
-    is_arn = mid.startswith("arn:")
-    if not is_arn and not mid.startswith(PROFILE_ID_PREFIXES):
-        return short_model(mid)  # 直调 foundation model
-    if not is_arn:
-        # 系统跨区 profile：id 本身已含模型名，无需 API 反查（global 视图下反查会拖慢）
-        return mid
-    pid = mid.split("/")[-1]
-    fm = underlying_model(regions, mid, sess)  # application profile：ARN 看不出模型，反查
+    """直调模型显示模型名；系统跨区 profile 显示完整 id；
+    application inference profile(ARN 或裸 id, CloudWatch 记的是裸 id)反查出
+    profile 名和底层模型, 显示 '名字/id (底层模型名)'。"""
+    if not mid.startswith("arn:"):
+        if mid.startswith(PROFILE_ID_PREFIXES):
+            return mid  # 系统跨区 profile：id 本身已含模型名，免 API 反查
+        if "." in mid:
+            return short_model(mid)  # 直调 foundation model（vendor.model 必含点号）
+    # application inference profile：ARN 或无点号裸 id（如 ej8uoudeuci1）
+    pid = mid.split("/")[-1] if mid.startswith("arn:") else mid
+    name, fm = profile_info(regions, mid, sess)
+    label = name or pid
     if fm:
-        return f"{pid} ({short_model(fm)})"
-    return pid
+        return f"{label} ({short_model(fm)})"
+    return label
 
 
 def price_for(model_id, regions, sess=None):
