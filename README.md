@@ -61,7 +61,10 @@ flowchart TD
 | **Function URL** (AWS_IAM) | Lambda 入口,仅 CloudFront 可经 OAC 调用 |
 | **CloudFront** + **OAC** | 全球边缘、HTTPS、隐藏源站;OAC 用 SigV4 锁定源站 |
 | **CloudFront Function** | viewer-request 阶段做 HTTP Basic Auth |
-| **Secrets Manager** | `bedrock-dashboard/prices`(单价)、`bedrock-dashboard/accounts`(账号注册表) |
+| **Secrets Manager** | `…/prices`(单价)、`…/accounts`(账号注册表)、`…/alerts`(分账告警配置) |
+| **EventBridge Rule** | 默认 `rate(6 hours)` 定时触发 Lambda:检查不可分账用量 + 刷新 S3 快照 |
+| **S3 缓存桶** | 私有、7 天生命周期;存 7 天 global 快照,页面打开秒出数据 |
+| **钉钉 webhook** | 发现非 app inference profile 用量时推送 markdown 告警(支持加签) |
 | **BedrockUsageReader** | 部署在**每个被纳管账号**的只读角色(`onboard-account.yaml`) |
 
 ## 🚀 一键部署
