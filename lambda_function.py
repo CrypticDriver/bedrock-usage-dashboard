@@ -1192,7 +1192,11 @@ async function saveAlerts(){
   }catch(e){m.textContent='❌ '+e.message;}
 }
 async function testAlert(){
-  const m=document.getElementById('alertSave');m.textContent='🧪 检查中(全区域约1分钟)…';
+  const m=document.getElementById('alertSave');
+  m.textContent='💾 先保存配置…';
+  await saveAlerts();
+  if(m.textContent.startsWith('❌'))return;
+  m.textContent='🧪 检查中(全区域约1分钟)…';
   try{
     const d=await getJSON('?action=test_alert&key=');
     if(d.error)throw new Error(d.error);
