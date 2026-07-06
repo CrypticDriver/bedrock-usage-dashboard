@@ -11,7 +11,7 @@
 #   进阶:  REGION=us-west-2 STACK=bedrock-dashboard DASH_USER=admin \
 #          ALERT_RATE='rate(12 hours)' DASH_PASS='xxx' ./deploy.sh
 #
-# 依赖: aws cli v2, python3。卸载: ./destroy.sh
+# 依赖: aws cli v2。卸载: ./destroy.sh
 # =============================================================================
 set -euo pipefail
 
