@@ -883,7 +883,7 @@ td:first-child,th:first-child{text-align:left}
 tr{border-top:1px solid rgba(255,255,255,.07)}
 tbody tr:hover{background:rgba(255,255,255,.04)}
 .cost{color:#34d399;font-weight:600}
-.pill{font-size:11px;color:#9aa3c7;background:rgba(255,255,255,.06);padding:2px 8px;border-radius:999px}
+.pill{font-size:11px;color:#9aa3c7;background:rgba(255,255,255,.06);padding:2px 8px;border-radius:999px;white-space:nowrap;display:inline-block}
 .pill.ok{color:#34d399;background:rgba(52,211,153,.1);border:1px solid rgba(52,211,153,.3)}
 .pill.warn{color:#fbbf24;background:rgba(251,191,36,.08);border:1px solid rgba(251,191,36,.3)}
 .unknown{color:#fb7185}
