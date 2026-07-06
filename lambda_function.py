@@ -1153,15 +1153,14 @@ function renderMain(){
     <div class="card"><div class="k">输出 tokens</div><div class="v">${tok(tOut)}</div></div>
     <div class="card"><div class="k">模型数</div><div class="v">${d.rows.length}</div></div>`;
   document.getElementById('table').innerHTML=`${d.cached_at?`<div class="muted" style="margin:0 0 10px">📸 快照数据 · 生成于 ${d.cached_at} UTC · 点「🔍 查询估算」获取实时</div>`:''}<table>
-    <thead><tr><th>模型</th><th>类型</th><th>输入</th><th>输出</th><th>缓存读</th><th>缓存写</th><th>估算成本</th><th>单价来源</th></tr></thead>
-    <tbody>${d.rows.map(x=>`<tr>
-      <td title="${x.id}">${x.model}</td>
+    <thead><tr><th>模型</th><th>类型</th><th>输入</th><th>输出</th><th>缓存读</th><th>缓存写</th><th>估算成本</th></tr></thead>
+    <tbody>${d.rows.map(x=>`<tr title="${x.arn||x.id}">
+      <td>${x.model}</td>
       <td style="text-align:left"><span class="pill ${x.taggable?'ok':'warn'}" title="${x.taggable?(x.arn||x.id):'不可按标签分账'}">${x.kind||''}</span></td>
       <td>${tok(x.in)}</td><td>${tok(x.out)}</td>
       <td>${tok(x.cache_read)}</td><td>${tok(x.cache_write)}</td>
-      <td class="cost">≈ $${fmt(x.cost)}</td>
-      <td><span class="pill ${x.price==='UNKNOWN'?'unknown':''}">${x.price}</span></td></tr>`).join('')
-      ||'<tr><td colspan=8 style="text-align:center;color:#8b94b8">该窗口无用量</td></tr>'}</tbody></table>`;
+      <td class="cost">≈ $${fmt(x.cost)}</td></tr>`).join('')
+      ||'<tr><td colspan=7 style="text-align:center;color:#8b94b8">该窗口无用量</td></tr>'}</tbody></table>`;
 }
 function pick(id){document.getElementById('seriesModel').value=id;drawSeries();
   document.getElementById('chart').scrollIntoView({behavior:'smooth',block:'center'});}
