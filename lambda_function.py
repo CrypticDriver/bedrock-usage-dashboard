@@ -23,6 +23,8 @@ LAMBDA_REGION = os.environ.get("AWS_REGION", "us-west-2")
 PRICE_SECRET = os.environ.get("PRICE_SECRET", "bedrock-dashboard/prices")
 ACCOUNTS_SECRET = os.environ.get("ACCOUNTS_SECRET", "bedrock-dashboard/accounts")
 ALERTS_SECRET = os.environ.get("ALERTS_SECRET", "bedrock-dashboard/alerts")
+# 运维深水区面板(错误监控/运行时灰区)默认关闭,精简部署;要开在 CFN 参数 EnableOpsPanels=true
+ENABLE_OPS_PANELS = os.environ.get("ENABLE_OPS_PANELS", "").lower() in ("1", "true", "yes")
 EDIT_KEY = os.environ.get("EDIT_KEY", "")
 PRICE_TTL = 60  # 单价缓存秒数
 DEFAULT_SESS = boto3.Session()  # 中心账号默认会话
@@ -767,9 +769,15 @@ def lambda_handler(event, context):
             return _json(gray_area(region, lg, start, end, session_for(account)))
     except Exception as e:
         return _json({"error": str(e)}, 500)
+    page = HTML
+    if not ENABLE_OPS_PANELS:
+        start = page.find("<!--OPS_PANELS_START-->")
+        end = page.find("<!--OPS_PANELS_END-->")
+        if start != -1 and end != -1:
+            page = page[:start] + "<!-- ops panels disabled (EnableOpsPanels=false) -->" + page[end + len("<!--OPS_PANELS_END-->"):]
     return {"statusCode": 200,
             "headers": {"content-type": "text/html; charset=utf-8", "cache-control": "no-store"},
-            "body": HTML}
+            "body": page}
 
 
 HTML = r"""<!DOCTYPE html>
@@ -911,6 +919,7 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
   </div>
   <div class="cards" id="cards"></div>
   <div id="table"></div>
+  <!--OPS_PANELS_START-->
   <div class="panel">
     <div class="phead" onclick="toggleErr()">
       <h3>🚨 错误监控 <span class="muted">· 基于 CloudWatch 指标 · 含 mantle 与历史</span></h3>
@@ -955,6 +964,7 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
       </div>
     </div>
   </div>
+  <!--OPS_PANELS_END-->
   </div>
   <div id="configView" style="display:none">
   <div class="panel">
@@ -1112,12 +1122,14 @@ function togglePrice(){
   document.getElementById('priceToggle').textContent=open?'收起 ▴':'展开 ▾';
 }
 function toggleGray(){
+  if(!document.getElementById('grayWrap'))return;
   var w=document.getElementById('grayWrap'),open=w.style.display==='none';
   w.style.display=open?'block':'none';
   document.getElementById('grayToggle').textContent=open?'收起 ▴':'展开 ▾';
   if(open) grayPickRegion();
 }
 function toggleErr(){
+  if(!document.getElementById('errWrap'))return;
   var w=document.getElementById('errWrap'),open=w.style.display==='none';
   w.style.display=open?'block':'none';
   document.getElementById('errToggle').textContent=open?'收起 ▴':'展开 ▾';

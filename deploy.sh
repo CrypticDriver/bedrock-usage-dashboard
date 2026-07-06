@@ -20,6 +20,7 @@ STACK="${STACK:-bedrock-dashboard}"
 DASH_USER="${DASH_USER:-admin}"
 DASH_PASS="${DASH_PASS:-}"
 ALERT_RATE="${ALERT_RATE:-rate(6 hours)}"
+OPS_PANELS="${OPS_PANELS:-false}"
 
 command -v aws >/dev/null || { echo "❌ 需要 aws cli"; exit 1; }
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
@@ -57,7 +58,7 @@ aws cloudformation package \
   --output-template-file "$TMP/packaged.yaml" --region "$REGION" >/dev/null
 
 echo ">> 部署栈(首次约 5-8 分钟, CloudFront 分发较慢)…"
-PARAMS=("AlertScheduleRate=$ALERT_RATE")
+PARAMS=("AlertScheduleRate=$ALERT_RATE" "EnableOpsPanels=$OPS_PANELS")
 if [ -n "$DASH_PASS" ]; then
   PARAMS+=("DashUser=$DASH_USER" "DashPass=$DASH_PASS")
 fi

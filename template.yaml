@@ -18,6 +18,11 @@ Parameters:
     Type: String
     Default: rate(6 hours)
     Description: 分账告警定时检查频率(EventBridge schedule expression)
+  EnableOpsPanels:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: 是否启用运维深水区面板(错误监控/运行时灰区);默认关闭以精简功能
 
 Resources:
 
@@ -111,6 +116,7 @@ Resources:
           PRICE_SECRET: !Ref PricesSecret
           ACCOUNTS_SECRET: !Ref AccountsSecret
           ALERTS_SECRET: !Ref AlertsSecret
+          ENABLE_OPS_PANELS: !Ref EnableOpsPanels
 
   FunctionUrl:
     Type: AWS::Lambda::Url

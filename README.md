@@ -14,6 +14,7 @@
 - **⚙️ 单价可配置** — 单价存于 Secrets Manager,页面可视化编辑;支持「从 AWS Price List API 拉取」官方价
 - **🔎 三形态模型区分** — 直连模型 ID / 系统跨区 profile(`us.`/`global.`)/ application inference profile 在表格中清晰区分;app profile 自动反查显示 `名字 (底层模型)` 并匹配单价
 - **🔔 分账告警(钉钉)** — 只有 application inference profile 支持成本分配标签;EventBridge 定时(默认 6h)扫描,发现**直连模型 ID / 系统 profile 的用量**(无法分账)即推送钉钉 webhook(支持加签),页面可视化配置
+- **🧰 可选运维面板** — 错误监控 / 运行时"灰区"统计默认关闭(精简部署);`OPS_PANELS=true ./deploy.sh` 一键开启
 - **📅 UTC 对齐账单** — 按 UTC 天聚合,与 AWS 出账口径一致;支持日期范围与「千 token」账单口径单位切换
 - **🔐 登录鉴权** — CloudFront Function 实现 Basic Auth,边缘拦截,保护全站
 - **🧩 极简架构** — 单 Lambda + Function URL + CloudFront,无 S3 / 无 API Gateway / 无数据库
@@ -77,6 +78,7 @@ DASH_PASS='你的登录密码' ./deploy.sh
 | `STACK` | `bedrock-dashboard` | 栈名 |
 | `DASH_USER` / `DASH_PASS` | `admin` / — | 登录账密(首次必填 `DASH_PASS`,更新时省略=沿用) |
 | `ALERT_RATE` | `rate(6 hours)` | 分账告警定时频率,如 `rate(12 hours)` |
+| `OPS_PANELS` | `false` | 开启错误监控/运行时灰区面板(重度运维功能) |
 
 - **更新**:改完代码再跑一遍 `./deploy.sh` 即可(密码不用重给)。
 - **卸载**:`./destroy.sh`(删整个栈,CloudFront 禁用+删除全自动)。
