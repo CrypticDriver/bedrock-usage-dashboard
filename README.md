@@ -12,9 +12,12 @@
 - **🌍 区域与 global** — 单区域查询,或 `global` 跨所有已启用区域并发聚合(适配 `global.*` 跨区推理配置)
 - **🏢 多账号 / 跨 Org** — 中心 Lambda 通过 AssumeRole 读取其他账号的 CloudWatch;页面一键生成接入命令,粘到目标账号即纳管。**不依赖同一个 AWS Organization**
 - **⚙️ 单价可配置** — 单价存于 Secrets Manager,页面可视化编辑;支持「从 AWS Price List API 拉取」官方价
+- **📸 快照秒开** — 告警定时任务顺手把 7 天 global 数据快照到栈内私有 S3(7 天生命周期);页面打开约 0.3s 出数(带快照时间角标),点「查询估算」才做实时全区域扫描(CloudFront 源超时已调至 60s)
+- **🏷️ 类型列 + 行悬浮 ARN** — 每行标注「模型 ID / 系统跨区 profile / 应用推理 profile」(绿=可分账,黄=不可);鼠标悬停任意行即时浮出完整 ARN / ModelId,方便复制排查
 - **🔎 三形态模型区分** — 直连模型 ID / 系统跨区 profile(`us.`/`global.`)/ application inference profile 在表格中清晰区分;app profile 自动反查显示 `名字 (底层模型)` 并匹配单价
 - **🔔 分账告警(钉钉)** — 只有 application inference profile 支持成本分配标签;EventBridge 定时(默认 6h)扫描,发现**直连模型 ID / 系统 profile 的用量**(无法分账)即推送钉钉 webhook(支持加签),页面可视化配置
 - **🧰 可选运维面板** — 错误监控 / 运行时"灰区"统计默认关闭(精简部署);`OPS_PANELS=true ./deploy.sh` 一键开启
+- **⚡ 默认近 7 天** — 打开即查最近 7 天(可切 30/90 天或自选日期)
 - **📅 UTC 对齐账单** — 按 UTC 天聚合,与 AWS 出账口径一致;支持日期范围与「千 token」账单口径单位切换
 - **🔐 登录鉴权** — CloudFront Function 实现 Basic Auth,边缘拦截,保护全站
 - **🧩 极简架构** — 单 Lambda + Function URL + CloudFront,无 S3 / 无 API Gateway / 无数据库
