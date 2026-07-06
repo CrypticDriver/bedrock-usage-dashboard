@@ -275,6 +275,7 @@ def is_taggable_profile(mid):
 
 
 def load_alerts():
+    sm = boto3.client("secretsmanager", region_name=LAMBDA_REGION)
     try:
         cfg = json.loads(sm.get_secret_value(SecretId=ALERTS_SECRET)["SecretString"])
     except Exception:
@@ -298,6 +299,7 @@ def save_alerts(cfg):
     }
     if clean["webhook"] and not clean["webhook"].startswith("https://"):
         raise ValueError("webhook 必须是 https URL")
+    sm = boto3.client("secretsmanager", region_name=LAMBDA_REGION)
     sm.put_secret_value(SecretId=ALERTS_SECRET, SecretString=json.dumps(clean))
     return clean
 
