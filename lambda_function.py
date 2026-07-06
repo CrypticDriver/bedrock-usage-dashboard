@@ -789,14 +789,12 @@ HTML = r"""<!DOCTYPE html>
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif;
   background:#0a0e1a;color:#e6ebff;min-height:100vh;padding:32px 20px}
 .bg{position:fixed;inset:0;z-index:0;overflow:hidden}
-.bg span{position:absolute;border-radius:50%;filter:blur(80px);opacity:.5;mix-blend-mode:screen}
-.b1{width:46vw;height:46vw;background:#6d28d9;top:-12%;left:-8%}
-.b2{width:40vw;height:40vw;background:#2563eb;bottom:-15%;right:-8%}
-.b3{width:34vw;height:34vw;background:#db2777;top:38%;right:24%}
+.bg span{position:absolute;border-radius:50%;filter:blur(110px);opacity:.14}
+.b1{width:44vw;height:44vw;background:#4f46e5;top:-14%;left:-10%}
+.b2{width:38vw;height:38vw;background:#0ea5e9;bottom:-18%;right:-10%}
+.b3{display:none}
 .wrap{position:relative;z-index:1;max-width:1080px;margin:0 auto}
-h1{font-size:28px;font-weight:800;letter-spacing:-.5px;
-  background:linear-gradient(120deg,#fff,#a5b4fc,#f0abfc);-webkit-background-clip:text;
-  background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:6px}
+h1{font-size:26px;font-weight:700;letter-spacing:-.3px;color:#f4f6ff;margin-bottom:6px}
 .sub{color:#8b94b8;font-size:13px;margin-bottom:16px}
 .notice{display:flex;gap:10px;align-items:flex-start;background:rgba(251,191,36,.1);
   border:1px solid rgba(251,191,36,.35);border-radius:12px;padding:12px 16px;margin-bottom:20px;
@@ -806,9 +804,9 @@ h1{font-size:28px;font-weight:800;letter-spacing:-.5px;
 .bar label{font-size:13px;color:#aab2d6}
 select,input{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.16);
   color:#e6ebff;padding:8px 12px;border-radius:10px;font-size:14px;color-scheme:dark}
-button{background:linear-gradient(135deg,#a5b4fc,#f0abfc);color:#0b1020;border:none;
+button{background:#4f46e5;color:#fff;border:none;
   padding:9px 20px;border-radius:10px;font-weight:600;cursor:pointer;font-size:14px}
-button:hover{opacity:.9}
+button:hover{background:#6366f1}
 button:disabled{opacity:.35;cursor:not-allowed;filter:grayscale(1)}
 .preset{background:rgba(255,255,255,.07);color:#cdd6ff;border:1px solid rgba(255,255,255,.16);
   padding:8px 14px;font-weight:500}
@@ -818,8 +816,7 @@ button:disabled{opacity:.35;cursor:not-allowed;filter:grayscale(1)}
 .card.hl{border-color:rgba(52,211,153,.4);background:rgba(52,211,153,.07)}
 .card .k{font-size:12px;color:#8b94b8;margin-bottom:6px}
 .card .v{font-size:25px;font-weight:700;font-variant-numeric:tabular-nums}
-.card .v.cost{background:linear-gradient(120deg,#34d399,#a5b4fc);-webkit-background-clip:text;
-  background-clip:text;-webkit-text-fill-color:transparent}
+.card .v.cost{color:#34d399}
 .card .tag{font-size:10px;color:#34d399;border:1px solid rgba(52,211,153,.4);
   border-radius:999px;padding:1px 7px;margin-left:6px;vertical-align:middle}
 .panel{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.12);
@@ -880,8 +877,7 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
   border-right:1px solid rgba(255,255,255,.12);padding:0 15px;height:38px;border-radius:0;font-weight:500}
 .seg button:last-child{border-right:none}
 .seg button:hover{background:rgba(165,180,252,.16)}
-.toolbar .primary{margin-left:auto;height:38px;padding:0 26px;font-weight:700;
-  background:linear-gradient(135deg,#a5b4fc,#f0abfc)}
+.toolbar .primary{margin-left:auto;height:38px;padding:0 26px;font-weight:700}
 .codebox{background:#05080f;border:1px solid rgba(255,255,255,.14);border-radius:10px;
   padding:14px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:#9fe7c4;
   white-space:pre-wrap;word-break:break-all;line-height:1.7;max-height:300px;overflow:auto;margin:10px 0}
@@ -1077,7 +1073,7 @@ function preset(days){
 }
 async function load(){
   const start=document.getElementById('start').value, end=document.getElementById('end').value;
-  if(!start||!end){preset(30);return;}
+  if(!start||!end){preset(7);return;}
   document.getElementById('meta').textContent='加载中…';
   document.getElementById('cards').innerHTML='';
   document.getElementById('table').innerHTML='<div class="loading">⏳ 正在查询 CloudWatch…</div>';
@@ -1390,7 +1386,7 @@ function renderChart(pts){
     ${gl}<polygon points="${area}" fill="url(#g)"/>
     <polyline points="${line}" fill="none" stroke="#34d399" stroke-width="2"/>${dots}${xl}</svg>`;
 }
-preset(30);
+preset(7);
 loadPrices();
 loadAccounts();
 </script>
