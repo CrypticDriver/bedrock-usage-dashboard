@@ -1,6 +1,6 @@
 # Bedrock Usage Dashboard
 
-一个**极简、serverless、跨账号(跨 Org)**的 Amazon Bedrock token 用量与成本估算看板。基于 CloudWatch `AWS/Bedrock` 指标,单个 Lambda 同时提供 API 和炫酷的前端页面,通过 CloudFront 公网访问(HTTPS、不暴露源站 IP),并带 Basic Auth 登录鉴权。
+一个**极简、serverless、跨账号(跨 Org)**的 Amazon Bedrock token 用量与成本估算看板。基于 CloudWatch `AWS/Bedrock` 指标,单个 Lambda 同时提供 API 和暗色主题前端页面,通过 CloudFront 公网访问(HTTPS、不暴露源站 IP),并带 Basic Auth 登录鉴权。
 
 > ⚠️ **金额均为估算值,非真实账单。** 基于 CloudWatch token 用量 × 可配置单价推算。精确对账请以 AWS Cost Explorer / CUR 为准(单价、Batch 折扣、Provisioned Throughput、1M 上下文溢价等会造成差异)。
 
@@ -20,7 +20,7 @@
 - **⚡ 默认近 7 天** — 打开即查最近 7 天(可切 30/90 天或自选日期)
 - **📅 UTC 对齐账单** — 按 UTC 天聚合,与 AWS 出账口径一致;支持日期范围与「千 token」账单口径单位切换
 - **🔐 登录鉴权** — CloudFront Function 实现 Basic Auth,边缘拦截,保护全站
-- **🧩 极简架构** — 单 Lambda + Function URL + CloudFront,无 S3 / 无 API Gateway / 无数据库
+- **🧩 极简架构** — 单 Lambda + Function URL + CloudFront + 一个小缓存桶,无 API Gateway / 无数据库
 
 ## 🏗 架构
 
@@ -69,7 +69,7 @@ flowchart TD
 
 ## 🚀 一键部署
 
-前置:已配置 AWS 凭证(需 aws cli v2 + python3)。**所有资源由 CloudFormation 栈统一管理**(便于变更/卸载,也不会被各类"资源清理"工具误删散装资源):
+前置:已配置 AWS 凭证(仅需 aws cli v2)。**所有资源由 CloudFormation 栈统一管理**(便于变更/卸载,也不会被各类"资源清理"工具误删散装资源):
 
 ```bash
 git clone https://github.com/CrypticDriver/bedrock-usage-dashboard.git
@@ -161,11 +161,11 @@ DASH_PASS='你的登录密码' ./deploy.sh
 
 - 全站经 CloudFront Function Basic Auth 保护;Function URL 为 `AWS_IAM`,仅 CloudFront 经 OAC 可调
 - Basic Auth 为单一共享凭证、简单门禁;如需个人化登录/SSO/审计,可换用 Amazon Cognito 或 IAM Identity Center
-- 修改登录密码:重跑 `deploy.sh`(会更新 CloudFront Function),或更新 `bedrock-dash-basicauth` 函数代码后 publish
+- 修改登录密码:`DASH_PASS='新密码' ./deploy.sh` 重跑一次即可(CloudFormation 会更新边缘鉴权函数)
 
 ## 💰 成本
 
-CloudFront、Lambda、Secrets Manager 在此类低流量场景下成本极低(多数月份接近 AWS 免费额度)。CloudWatch `GetMetricData` 按调用计费,`global` 跨区会增加调用量。
+每天打开数次的典型用量下**约 $2/月**:大头是 Secrets Manager 3 个密钥的固定 $1.20,其余(Lambda + CloudWatch API + CloudFront + S3)合计不到 $1。`AWS/Bedrock` 命名空间是服务原生指标,**指标本身免费**,只付 `GetMetricData` 查询费($0.01/千指标);`global` 跨区会增加调用量。灰区功能若开启 Model Invocation Logging,另计 CloudWatch Logs 摄入费($0.50/GB)。
 
 ## ⚠️ 估算误差来源
 
