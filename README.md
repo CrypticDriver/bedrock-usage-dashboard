@@ -116,6 +116,9 @@ DASH_PASS='你的登录密码' ./deploy.sh
 
 ## 🩶 运行时"灰区"统计(看板内置面板)
 
+> ⚠️ 此面板与「错误监控」面板**默认隐藏**(精简部署)。需要时用 `OPS_PANELS=true ./deploy.sh` 开启。
+
+
 被限流(429)、客户端 4xx、推理前失败的请求**不计 token、不计费**。会"悄悄计费"的是**失败请求里已被处理的 token**:输入只要被模型读入就计费;输出为**流式中途失败**已产出的部分。
 
 看板主页「**🩶 运行时灰区**」面板基于 **Model Invocation Logging** 日志精确统计这部分(日志条目含 `errorCode` 与 token 数,**灰区 = errorCode 存在**;无需 CloudTrail):面板里选区域、填日志组(默认 `br_invocation_loggroup`)、用当前「账号/日期」查询,显示失败已计费的输入/输出 token 及按模型+错误类型的明细。
@@ -142,6 +145,8 @@ DASH_PASS='你的登录密码' ./deploy.sh
 | `GET /?format=accounts` | 已注册账号列表 |
 | `GET /?format=prices` | 当前单价 |
 | `GET /?format=gray&region=&loggroup=&account=` | 失败请求计费 token(运行时灰区) |
+| `GET /?format=json&region=global&cached=1` | 优先返回 S3 快照(秒回,含 `cached_at`) |
+| `GET /?format=alerts` / `GET /?action=test_alert` | 分账告警配置 / 手动触发一次检查(异步) |
 
 时间:`start`/`end` 为 `YYYY-MM-DD`(UTC);或用 `days=30`。`region` 可填具体区或 `global`。
 
