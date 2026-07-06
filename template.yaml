@@ -14,6 +14,10 @@ Parameters:
     Type: String
     NoEcho: true
     Description: 看板登录密码(Basic Auth)
+  AlertScheduleRate:
+    Type: String
+    Default: rate(6 hours)
+    Description: 分账告警定时检查频率(EventBridge schedule expression)
 
 Resources:
 
@@ -30,6 +34,13 @@ Resources:
       Name: !Sub "${AWS::StackName}/accounts"
       Description: Registered accounts for cross-account Bedrock dashboard
       SecretString: '[]'
+
+  AlertsSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}/alerts"
+      Description: DingTalk webhook config for untagged-usage alerts
+      SecretString: '{"webhook":"","sign_secret":"","window_hours":6,"region":"global","enabled":false}'
 
   DashboardRole:
     Type: AWS::IAM::Role
@@ -72,6 +83,7 @@ Resources:
                 Resource:
                   - !Ref PricesSecret
                   - !Ref AccountsSecret
+                  - !Ref AlertsSecret
               - Sid: Logs
                 Effect: Allow
                 Action:
@@ -87,13 +99,14 @@ Resources:
       Runtime: python3.12
       Handler: lambda_function.lambda_handler
       CodeUri: .
-      Timeout: 60
+      Timeout: 120
       MemorySize: 1024
       Role: !GetAtt DashboardRole.Arn
       Environment:
         Variables:
           PRICE_SECRET: !Ref PricesSecret
           ACCOUNTS_SECRET: !Ref AccountsSecret
+          ALERTS_SECRET: !Ref AlertsSecret
 
   FunctionUrl:
     Type: AWS::Lambda::Url
@@ -168,6 +181,25 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: cloudfront.amazonaws.com
       SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+
+  AlertSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Bedrock dashboard untagged-usage alert check
+      ScheduleExpression: !Ref AlertScheduleRate
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DashboardFunction.Arn
+          Id: alert-check
+          Input: '{"action":"alert_check"}'
+
+  AllowEventsInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DashboardFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AlertSchedule.Arn
 
 Outputs:
   DashboardURL:

@@ -22,6 +22,7 @@ FAST = Config(connect_timeout=3, read_timeout=12, retries={"max_attempts": 2},
 LAMBDA_REGION = os.environ.get("AWS_REGION", "us-west-2")
 PRICE_SECRET = os.environ.get("PRICE_SECRET", "bedrock-dashboard/prices")
 ACCOUNTS_SECRET = os.environ.get("ACCOUNTS_SECRET", "bedrock-dashboard/accounts")
+ALERTS_SECRET = os.environ.get("ALERTS_SECRET", "bedrock-dashboard/alerts")
 EDIT_KEY = os.environ.get("EDIT_KEY", "")
 PRICE_TTL = 60  # 单价缓存秒数
 DEFAULT_SESS = boto3.Session()  # 中心账号默认会话
@@ -262,6 +263,103 @@ def price_for(model_id, regions, sess=None):
         if price:
             return price, f"{psource}:{key} (profile→{fm.split('.')[-1]})"
     return None, "UNKNOWN"
+
+
+
+def is_taggable_profile(mid):
+    """只有 application inference profile 能打成本分配标签(可分账)。
+    CloudWatch ModelId 三形态: 直连fm id(含点号) / 系统跨区 profile(区域前缀,含点号) / app profile 裸id或ARN。"""
+    if mid.startswith("arn:"):
+        return ":application-inference-profile/" in mid
+    return "." not in mid  # 裸 app profile id 无点号
+
+
+def load_alerts():
+    try:
+        cfg = json.loads(sm.get_secret_value(SecretId=ALERTS_SECRET)["SecretString"])
+    except Exception:
+        cfg = {}
+    return {
+        "webhook": str(cfg.get("webhook", "") or ""),
+        "sign_secret": str(cfg.get("sign_secret", "") or ""),
+        "window_hours": int(cfg.get("window_hours", 6) or 6),
+        "region": str(cfg.get("region", "global") or "global"),
+        "enabled": bool(cfg.get("enabled", False)),
+    }
+
+
+def save_alerts(cfg):
+    clean = {
+        "webhook": str(cfg.get("webhook", "") or "").strip(),
+        "sign_secret": str(cfg.get("sign_secret", "") or "").strip(),
+        "window_hours": max(1, min(48, int(cfg.get("window_hours", 6) or 6))),
+        "region": str(cfg.get("region", "global") or "global").strip() or "global",
+        "enabled": bool(cfg.get("enabled", False)),
+    }
+    if clean["webhook"] and not clean["webhook"].startswith("https://"):
+        raise ValueError("webhook 必须是 https URL")
+    sm.put_secret_value(SecretId=ALERTS_SECRET, SecretString=json.dumps(clean))
+    return clean
+
+
+def dingtalk_send(webhook, sign_secret, title, text):
+    import base64
+    import hashlib
+    import hmac
+    import time as _t
+    import urllib.parse
+    import urllib.request
+    url = webhook
+    if sign_secret:
+        ts = str(round(_t.time() * 1000))
+        digest = hmac.new(sign_secret.encode(), f"{ts}\n{sign_secret}".encode(), hashlib.sha256).digest()
+        sign = urllib.parse.quote_plus(base64.b64encode(digest).decode())
+        url = f"{url}{'&' if '?' in url else '?'}timestamp={ts}&sign={sign}"
+    payload = {"msgtype": "markdown", "markdown": {"title": title, "text": text}}
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json"})
+    return json.loads(urllib.request.urlopen(req, timeout=10).read().decode())
+
+
+def run_alert_check(cfg=None, force_send=False):
+    """扫描窗口内非 app-inference-profile 用量(不可分账),命中则推钉钉。"""
+    cfg = cfg or load_alerts()
+    hours = max(1, min(48, int(cfg.get("window_hours", 6))))
+    end = dt.datetime.now(dt.UTC)
+    start = end - dt.timedelta(hours=hours)
+    data = build_data(cfg.get("region", "global"), start, end)
+    bad = [r for r in data["rows"] if not is_taggable_profile(r["id"])]
+    total_bad = round(sum(r["cost"] for r in bad), 2)
+    result = {"checked": True, "window_hours": hours, "region": cfg.get("region", "global"),
+              "start": start.strftime("%Y-%m-%d %H:%M"), "end": end.strftime("%Y-%m-%d %H:%M"),
+              "violations": bad, "violation_cost": total_bad,
+              "enabled": cfg.get("enabled", False), "sent": False, "send_error": ""}
+    should_send = bool(bad) and bool(cfg.get("webhook")) and (cfg.get("enabled") or force_send)
+    if force_send and not bad and cfg.get("webhook"):
+        should_send = True  # 手动测试时没命中也推一条,便于验证 webhook 通不通
+    if should_send:
+        lines = [f"### ⚠️ Bedrock 未分账用量告警",
+                 f"近 **{hours}h**({result['start']}–{result['end']} UTC, 区域 {result['region']}) "
+                 f"存在**未走 application inference profile** 的调用,无法按标签分账:", ""]
+        if bad:
+            for r in bad[:15]:
+                lines.append(f"- **{r['model']}** in {r['in']:,} / out {r['out']:,} ≈ ${r['cost']}")
+            if len(bad) > 15:
+                lines.append(f"- …等共 {len(bad)} 个模型")
+            lines += ["", f"**合计 ≈ ${total_bad}**", "",
+                      "> 建议:为每个应用创建 application inference profile,调用时改用其 ARN。"]
+        else:
+            lines.append("(测试消息:当前窗口内未发现未分账用量 ✅)")
+        try:
+            resp = dingtalk_send(cfg["webhook"], cfg.get("sign_secret", ""),
+                                 "Bedrock 用量告警", "\n".join(lines))
+            if resp.get("errcode") == 0:
+                result["sent"] = True
+            else:
+                result["send_error"] = f"dingtalk errcode={resp.get('errcode')} {resp.get('errmsg', '')}"
+        except Exception as e:
+            result["send_error"] = str(e)[:300]
+    return result
 
 
 def regions_for(region):
@@ -559,6 +657,9 @@ def _json(obj, code=200):
 
 
 def lambda_handler(event, context):
+    if isinstance(event, dict) and not event.get("queryStringParameters") and (
+            event.get("action") == "alert_check" or event.get("source") == "aws.events"):
+        return run_alert_check()
     q = (event.get("queryStringParameters") or {}) if isinstance(event, dict) else {}
     q = q or {}
     region = q.get("region", "us-west-2")
@@ -593,6 +694,20 @@ def lambda_handler(event, context):
             lst = [x for x in load_accounts() if x.get("accountId") != q.get("accountId")]
             save_accounts(lst)
             return _json({"ok": True})
+        if fmt == "alerts":
+            return _json({"alerts": load_alerts(), "editable": True})
+        if q.get("action") == "save_alerts":
+            if EDIT_KEY and q.get("key") != EDIT_KEY:
+                return _json({"error": "编辑密钥无效"}, 403)
+            try:
+                cfg = save_alerts(json.loads(q.get("alerts_json", "{}")))
+            except Exception as e:
+                return _json({"error": str(e)}, 400)
+            return _json({"ok": True, "alerts": cfg})
+        if q.get("action") == "test_alert":
+            if EDIT_KEY and q.get("key") != EDIT_KEY:
+                return _json({"error": "编辑密钥无效"}, 403)
+            return _json(run_alert_check(force_send=True))
         if fmt == "pricelist":
             pr = fetch_price_list(region if region not in ("global", "all") else "us-east-1")
             return _json({"prices": pr, "source": "AWS Price List API",
@@ -866,6 +981,34 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
       </div>
     </div>
   </div>
+  <div class="panel">
+    <div class="phead" onclick="toggleAlertCfg()">
+      <h3>🔔 分账告警 <span class="muted">· 非 app inference profile 用量 → 钉钉 webhook</span></h3>
+      <span class="chev" id="alertToggle">展开 ▾</span>
+    </div>
+    <div id="alertWrap" style="display:none">
+      <div id="alertMeta" class="muted" style="margin-top:12px"></div>
+      <div class="savebar" style="flex-wrap:wrap;margin-top:10px">
+        <input id="alWebhook" placeholder="钉钉机器人 webhook (https://oapi.dingtalk.com/robot/send?access_token=...)" style="width:480px"/>
+        <input id="alSecret" placeholder="加签 secret (可选)" style="width:200px"/>
+      </div>
+      <div class="savebar" style="flex-wrap:wrap">
+        <label class="muted">窗口
+          <select id="alWindow"><option value="6">近 6 小时</option><option value="12">近 12 小时</option><option value="24">近 24 小时</option></select>
+        </label>
+        <label class="muted">区域 <input id="alRegion" value="global" style="width:120px"/></label>
+        <label class="muted"><input type="checkbox" id="alEnabled"/> 启用定时检查</label>
+        <button onclick="saveAlerts()">💾 保存</button>
+        <button class="preset" onclick="testAlert()">🧪 立即检查并推送</button>
+        <span id="alertSave" style="font-size:13px"></span>
+      </div>
+      <div class="muted" style="margin-top:12px;line-height:1.8">
+        <b>规则:</b>只有 <b>application inference profile</b> 支持成本分配标签;窗口内若出现<b>直连模型ID / 系统跨区 profile</b>(us./global. 前缀)的用量即告警(无法分账)。
+        EventBridge 定时触发(默认每 6 小时);机器人安全设置建议「加签」,若用「自定义关键词」需包含 <b>Bedrock</b>。
+        配置存于 Secrets Manager <b>bedrock-dashboard/alerts</b>。
+      </div>
+    </div>
+  </div>
   </div>
   <div class="foot">
     数据源 CloudWatch AWS/Bedrock(Sum),按 <b>UTC 天</b>聚合(与 AWS 账单口径一致)。global 会扫描所有已启用区域并聚合。
@@ -1016,6 +1159,50 @@ async function loadGray(){
         <td><span class="pill ${r.out>0?'unknown':''}">${r.errorCode}</span></td>
         <td>${fmt(r.calls)}</td><td>${fmt(r.in)}</td><td>${fmt(r.out)}</td></tr>`).join('')}</tbody></table>`;
   }catch(e){m.textContent='';document.getElementById('grayTable').innerHTML=`<div class="err">查询失败: ${e.message}</div>`;}
+}
+let alertLoaded=false;
+async function toggleAlertCfg(){
+  const w=document.getElementById('alertWrap'),t=document.getElementById('alertToggle');
+  const show=w.style.display==='none';
+  w.style.display=show?'block':'none';t.textContent=show?'收起 ▴':'展开 ▾';
+  if(show&&!alertLoaded){alertLoaded=true;await loadAlerts();}
+}
+async function loadAlerts(){
+  try{
+    const d=await getJSON('?format=alerts');const a=d.alerts||{};
+    document.getElementById('alWebhook').value=a.webhook||'';
+    document.getElementById('alSecret').value=a.sign_secret||'';
+    document.getElementById('alWindow').value=String(a.window_hours||6);
+    document.getElementById('alRegion').value=a.region||'global';
+    document.getElementById('alEnabled').checked=!!a.enabled;
+    document.getElementById('alertMeta').textContent=a.enabled?'✅ 定时检查已启用':'⏸ 定时检查未启用(保存时勾选「启用」)';
+  }catch(e){document.getElementById('alertMeta').textContent='加载失败: '+e.message;}
+}
+async function saveAlerts(){
+  const m=document.getElementById('alertSave');m.textContent='保存中…';
+  const cfg={webhook:document.getElementById('alWebhook').value.trim(),
+    sign_secret:document.getElementById('alSecret').value.trim(),
+    window_hours:parseInt(document.getElementById('alWindow').value,10),
+    region:document.getElementById('alRegion').value.trim()||'global',
+    enabled:document.getElementById('alEnabled').checked};
+  try{
+    const d=await getJSON(`?action=save_alerts&key=&alerts_json=${encodeURIComponent(JSON.stringify(cfg))}`);
+    if(d.error)throw new Error(d.error);
+    m.textContent='✅ 已保存';await loadAlerts();
+  }catch(e){m.textContent='❌ '+e.message;}
+}
+async function testAlert(){
+  const m=document.getElementById('alertSave');m.textContent='🧪 检查中(全区域约1分钟)…';
+  try{
+    const d=await getJSON('?action=test_alert&key=');
+    if(d.error)throw new Error(d.error);
+    const n=(d.violations||[]).length;
+    let msg=`发现 ${n} 个未分账模型,合计 ≈ $${d.violation_cost}`;
+    if(d.sent)msg+=' · 已推送钉钉 ✅';
+    else if(d.send_error)msg+=' · 推送失败: '+d.send_error;
+    else msg+=' · 未配置 webhook,未推送';
+    m.textContent=msg;
+  }catch(e){m.textContent='❌ '+e.message;}
 }
 function toggleView(){
   var m=document.getElementById('mainView'),c=document.getElementById('configView'),b=document.getElementById('navBtn');
