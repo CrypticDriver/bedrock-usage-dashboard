@@ -804,6 +804,44 @@ def ce_cost(start, end, sess=None):
             "note": note}
 
 
+def ce_cost_all(start, end):
+    """中心 + 全部注册账号逐账号查 CE, 一账号一行."""
+    rows = []
+    try:
+        central_id = central_role_arn().split(":")[4]
+    except Exception:
+        central_id = "中心账号"
+    targets = [{"accountId": None, "label": f"中心 {central_id}"}]
+    for a in load_accounts():
+        if a["accountId"] == central_id:
+            continue
+        targets.append({"accountId": a["accountId"],
+                        "label": a.get("label") or a["accountId"]})
+    total = tagged = untagged = 0.0
+    meta = {}
+    for t in targets:
+        try:
+            d = ce_cost(start, end, session_for(t["accountId"]))
+            meta = d
+            rows.append({"account": t["accountId"] or central_id, "label": t["label"],
+                         "total": d["total"], "tagged": d["tagged"],
+                         "untagged": d["untagged"], "taggedPct": d["taggedPct"]})
+            total += d["total"]
+            tagged += d["tagged"]
+            untagged += d["untagged"]
+        except Exception as e:
+            rows.append({"account": t["accountId"] or central_id, "label": t["label"],
+                         "error": str(e)[:200]})
+    return {"start": meta.get("start", start.date().isoformat()),
+            "end": meta.get("end", end.date().isoformat()),
+            "total": round(total, 2), "tagged": round(tagged, 2),
+            "untagged": round(untagged, 2),
+            "taggedPct": round(tagged / total * 100, 1) if total else 0.0,
+            "rows": rows,
+            "note": ("map-migrated 拆分需要各账号已将该 tag 激活为成本分配标签"
+                     "(激活后仅对新账单生效,历史不回填)" if total > 0 and tagged == 0 else "")}
+
+
 def _range(q):
     now = dt.datetime.now(dt.UTC)
     try:
@@ -921,7 +959,7 @@ def lambda_handler(event, context):
         if fmt == "loggroup":
             return _json(logging_log_group(region, session_for(account)))
         if fmt == "cecost":
-            return _json(ce_cost(start, end, session_for(account)))
+            return _json(ce_cost_all(start, end))
         if fmt == "errors":
             return _json(error_stats(region, start, end, session_for(account)))
         if fmt == "gray":
@@ -1086,7 +1124,7 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
   <div id="table"></div>
   <div class="panel">
     <div class="phead" onclick="toggleCe()">
-      <h3>💰 Bedrock 真实账单 <span class="muted">· Cost Explorer · 仅 Amazon Bedrock Service · 总费用 vs map-migrated 打标</span></h3>
+      <h3>💰 Bedrock 真实账单 <span class="muted">· Cost Explorer · 跨账号 · 一账号一行 · map-migrated 拆分</span></h3>
       <span class="chev" id="ceToggle">展开 ▾</span>
     </div>
     <div id="ceWrap" style="display:none">
@@ -1097,8 +1135,8 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
       <div class="cards" id="ceCards"></div>
       <div id="ceTable"></div>
       <div class="muted" style="margin-top:12px;line-height:1.7">
-        数据来自 <b>Cost Explorer 真实账单</b>(UnblendedCost,非估算),按当前「账号/日期」查询;区域选择不生效(CE 为全账单口径,含所有区域)。
-        map-migrated 拆分需要该 tag 已在 Billing 控制台激活为<b>成本分配标签</b>;跨账号查询需 reader 角色有 ce:GetCostAndUsage。每次查询产生 $0.01 CE API 费用。
+        数据来自 <b>Cost Explorer 真实账单</b>(UnblendedCost,仅 Amazon Bedrock Service 账单行,非估算),一次查询覆盖<b>中心 + 全部注册账号</b>,区域/账号选择器不影响本面板。
+        map-migrated 拆分需要各账号已激活该成本分配标签;跨账号需 reader 角色有 ce:GetCostAndUsage。每账号每次查询产生 $0.02 CE API 费用。
       </div>
     </div>
   </div>
@@ -1326,7 +1364,7 @@ async function loadCe(){
   document.getElementById('ceCards').innerHTML='';document.getElementById('ceTable').innerHTML='';
   try{
     const d=await getJSON(`?format=cecost&${qs()}`);
-    m.textContent=`账单窗口 ${d.start} → ${d.end}(末日不含) · 全区域合计`;
+    m.textContent=`账单窗口 ${d.start} → ${d.end}(末日不含) · 全区域 · 全部账号`;
     const money=x=>'$'+Number(x).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
     document.getElementById('ceCards').innerHTML=`
       <div class="card hl"><div class="k">Bedrock 总费用</div><div class="v">${money(d.total)}</div></div>
@@ -1334,14 +1372,12 @@ async function loadCe(){
       <div class="card"><div class="k">未打标</div><div class="v">${money(d.untagged)}</div></div>
       <div class="card"><div class="k">打标占比</div><div class="v">${d.taggedPct}%</div></div>`;
     let html='';
-    if(d.byService.length){
-      html+=`<table><thead><tr><th>账单服务行</th><th>费用</th></tr></thead><tbody>${
-        d.byService.map(r=>`<tr><td>${r.service}</td><td>${money(r.cost)}</td></tr>`).join('')}</tbody></table>`;
-    }else{html='<div class="loading">该窗口无 Bedrock 费用</div>';}
-    if(d.tagValues.length){
-      html+=`<div class="muted" style="margin-top:8px">标签值拆分: ${
-        d.tagValues.map(t=>`${t.value}=${money(t.cost)}`).join(' · ')}</div>`;
-    }
+    if(d.rows&&d.rows.length){
+      html+=`<table><thead><tr><th>账号</th><th>总费用</th><th>map-migrated 已打标</th><th>未打标</th><th>打标占比</th></tr></thead><tbody>${
+        d.rows.map(r=>r.error
+          ?`<tr><td>${r.label}</td><td colspan="4"><span class="err">查询失败: ${r.error}</span></td></tr>`
+          :`<tr><td>${r.label}</td><td>${money(r.total)}</td><td>${money(r.tagged)}</td><td>${money(r.untagged)}</td><td>${r.taggedPct}%</td></tr>`).join('')}</tbody></table>`;
+    }else{html='<div class="loading">该窗口无数据</div>';}
     if(d.note){html+=`<div class="muted" style="margin-top:8px">⚠️ ${d.note}</div>`;}
     document.getElementById('ceTable').innerHTML=html;
   }catch(e){m.textContent='';document.getElementById('ceTable').innerHTML=`<div class="err">查询失败: ${e.message}</div>`;}
