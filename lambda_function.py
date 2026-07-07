@@ -767,7 +767,7 @@ def ce_cost(start, end, sess=None):
     for period in resp.get("ResultsByTime", []):
         for g in period.get("Groups", []):
             name = g["Keys"][0]
-            if "bedrock" not in name.lower():
+            if name != "Amazon Bedrock Service":
                 continue
             amt = float(g["Metrics"]["UnblendedCost"]["Amount"])
             by_service[name] = by_service.get(name, 0.0) + amt
@@ -1086,7 +1086,7 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
   <div id="table"></div>
   <div class="panel">
     <div class="phead" onclick="toggleCe()">
-      <h3>💰 Bedrock 真实账单 <span class="muted">· Cost Explorer · 总费用 vs map-migrated 打标</span></h3>
+      <h3>💰 Bedrock 真实账单 <span class="muted">· Cost Explorer · 仅 Amazon Bedrock Service · 总费用 vs map-migrated 打标</span></h3>
       <span class="chev" id="ceToggle">展开 ▾</span>
     </div>
     <div id="ceWrap" style="display:none">
