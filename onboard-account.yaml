@@ -40,6 +40,7 @@ Resources:
                   - cloudwatch:ListMetrics
                   - bedrock:ListInferenceProfiles
                   - bedrock:GetInferenceProfile
+                  - ce:GetCostAndUsage
                 Resource: '*'
 
 Outputs:

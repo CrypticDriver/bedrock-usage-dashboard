@@ -3,8 +3,8 @@
 ## 1.3.0 (2026-07-07)
 
 **新增**
-- 💰 Bedrock 真实账单面板(Cost Explorer):按当前日期窗口展示 Bedrock 总费用(UnblendedCost,非估算)、map-migrated 已打标/未打标金额与占比、账单服务行拆分、标签值拆分;按钮触发查询(每次 $0.01 CE API 费用)
-- IAM 新增 ce:GetCostAndUsage 权限
+- 💰 Bedrock 真实账单面板(Cost Explorer):仅 Amazon Bedrock Service 账单行(UnblendedCost,非估算);<b>跨账号一账号一行</b>(中心 + 全部注册账号,中心同账号自动去重):总费用 / map-migrated 已打标 / 未打标 / 打标占比;按钮触发查询(每账号每次 $0.02 CE API 费用)
+- IAM 新增 ce:GetCostAndUsage(中心角色 + onboard-account.yaml reader 模板)
 
 ## 1.2.0 (2026-07-07)
 

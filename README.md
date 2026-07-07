@@ -9,6 +9,7 @@
 | 能力 | 说明 |
 |------|------|
 | 📊 用量与成本 | 按模型展示输入 / 输出 / 缓存读写 token 与估算成本;按 UTC 天聚合,对齐账单口径 |
+| 💰 真实账单 | Cost Explorer 拉 Amazon Bedrock Service 账单行(UnblendedCost,非估算),跨账号一账号一行:总费用 / map-migrated 已打标 / 未打标 / 占比 |
 | 🏷️ 分账视角 | 类型列区分**模型 ID / 系统跨区 profile / 应用推理 profile**(绿 = 可按标签分账);悬停任意行即显完整 ARN / ModelId |
 | 🔔 分账告警 | 发现无法分账的用量(未走 app inference profile)→ 推送**钉钉 webhook**(可加签);EventBridge 定时检查,页面可视化配置;支持忽略清单 + 按窗口节流防重复轰炸 |
 | 📸 快照秒开 | 定时任务把 7 天 global 数据快照到 S3,页面打开约 0.3s 出数;点「查询估算」才实时扫描 |
