@@ -754,6 +754,56 @@ def gray_area(region, log_group, start, end, sess=None):
             "rows": rows}
 
 
+def ce_cost(start, end, sess=None):
+    ce = (sess or boto3).client("ce", region_name="us-east-1")
+    s = start.date().isoformat()
+    today_next = dt.datetime.now(dt.UTC).date() + dt.timedelta(days=1)
+    e = min(end.date() + dt.timedelta(days=1), today_next).isoformat()
+    resp = ce.get_cost_and_usage(
+        TimePeriod={"Start": s, "End": e}, Granularity="MONTHLY",
+        Metrics=["UnblendedCost"],
+        GroupBy=[{"Type": "DIMENSION", "Key": "SERVICE"}])
+    by_service = {}
+    for period in resp.get("ResultsByTime", []):
+        for g in period.get("Groups", []):
+            name = g["Keys"][0]
+            if "bedrock" not in name.lower():
+                continue
+            amt = float(g["Metrics"]["UnblendedCost"]["Amount"])
+            by_service[name] = by_service.get(name, 0.0) + amt
+    total = sum(by_service.values())
+    tagged = untagged = 0.0
+    tag_values = {}
+    if by_service:
+        resp2 = ce.get_cost_and_usage(
+            TimePeriod={"Start": s, "End": e}, Granularity="MONTHLY",
+            Metrics=["UnblendedCost"],
+            Filter={"Dimensions": {"Key": "SERVICE", "Values": sorted(by_service)}},
+            GroupBy=[{"Type": "TAG", "Key": "map-migrated"}])
+        for period in resp2.get("ResultsByTime", []):
+            for g in period.get("Groups", []):
+                key = g["Keys"][0]
+                amt = float(g["Metrics"]["UnblendedCost"]["Amount"])
+                val = key.split("$", 1)[1] if "$" in key else ""
+                if val:
+                    tagged += amt
+                    tag_values[val] = tag_values.get(val, 0.0) + amt
+                else:
+                    untagged += amt
+    note = ""
+    if total > 0 and tagged == 0:
+        note = ("map-migrated 打标金额为 0:资源可能未打标,或该 tag 未在 Billing 控制台"
+                "激活为成本分配标签(激活后仅对之后产生的账单生效,历史不回填)")
+    return {"start": s, "end": e, "total": round(total, 2),
+            "tagged": round(tagged, 2), "untagged": round(untagged, 2),
+            "taggedPct": round(tagged / total * 100, 1) if total else 0.0,
+            "byService": [{"service": k, "cost": round(v, 2)}
+                          for k, v in sorted(by_service.items(), key=lambda x: -x[1])],
+            "tagValues": [{"value": k, "cost": round(v, 2)}
+                          for k, v in sorted(tag_values.items(), key=lambda x: -x[1])],
+            "note": note}
+
+
 def _range(q):
     now = dt.datetime.now(dt.UTC)
     try:
@@ -870,6 +920,8 @@ def lambda_handler(event, context):
             return _json(build_series(region, q["model"], start, end, session_for(account)))
         if fmt == "loggroup":
             return _json(logging_log_group(region, session_for(account)))
+        if fmt == "cecost":
+            return _json(ce_cost(start, end, session_for(account)))
         if fmt == "errors":
             return _json(error_stats(region, start, end, session_for(account)))
         if fmt == "gray":
@@ -1032,6 +1084,24 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
   </div>
   <div class="cards" id="cards"></div>
   <div id="table"></div>
+  <div class="panel">
+    <div class="phead" onclick="toggleCe()">
+      <h3>💰 Bedrock 真实账单 <span class="muted">· Cost Explorer · 总费用 vs map-migrated 打标</span></h3>
+      <span class="chev" id="ceToggle">展开 ▾</span>
+    </div>
+    <div id="ceWrap" style="display:none">
+      <div class="chartbar" style="margin:12px 0">
+        <button onclick="loadCe()">查询费用</button>
+        <span id="ceMeta" class="muted"></span>
+      </div>
+      <div class="cards" id="ceCards"></div>
+      <div id="ceTable"></div>
+      <div class="muted" style="margin-top:12px;line-height:1.7">
+        数据来自 <b>Cost Explorer 真实账单</b>(UnblendedCost,非估算),按当前「账号/日期」查询;区域选择不生效(CE 为全账单口径,含所有区域)。
+        map-migrated 拆分需要该 tag 已在 Billing 控制台激活为<b>成本分配标签</b>;跨账号查询需 reader 角色有 ce:GetCostAndUsage。每次查询产生 $0.01 CE API 费用。
+      </div>
+    </div>
+  </div>
   <!--OPS_PANELS_START-->
   <div class="panel">
     <div class="phead" onclick="toggleErr()">
@@ -1245,6 +1315,36 @@ function toggleGray(){
   w.style.display=open?'block':'none';
   document.getElementById('grayToggle').textContent=open?'收起 ▴':'展开 ▾';
   if(open) grayPickRegion();
+}
+function toggleCe(){
+  var w=document.getElementById('ceWrap'),open=w.style.display==='none';
+  w.style.display=open?'block':'none';
+  document.getElementById('ceToggle').textContent=open?'收起 ▴':'展开 ▾';
+}
+async function loadCe(){
+  const m=document.getElementById('ceMeta');m.textContent='查询 Cost Explorer…';
+  document.getElementById('ceCards').innerHTML='';document.getElementById('ceTable').innerHTML='';
+  try{
+    const d=await getJSON(`?format=cecost&${qs()}`);
+    m.textContent=`账单窗口 ${d.start} → ${d.end}(末日不含) · 全区域合计`;
+    const money=x=>'$'+Number(x).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+    document.getElementById('ceCards').innerHTML=`
+      <div class="card hl"><div class="k">Bedrock 总费用</div><div class="v">${money(d.total)}</div></div>
+      <div class="card"><div class="k">map-migrated 已打标</div><div class="v">${money(d.tagged)}</div></div>
+      <div class="card"><div class="k">未打标</div><div class="v">${money(d.untagged)}</div></div>
+      <div class="card"><div class="k">打标占比</div><div class="v">${d.taggedPct}%</div></div>`;
+    let html='';
+    if(d.byService.length){
+      html+=`<table><thead><tr><th>账单服务行</th><th>费用</th></tr></thead><tbody>${
+        d.byService.map(r=>`<tr><td>${r.service}</td><td>${money(r.cost)}</td></tr>`).join('')}</tbody></table>`;
+    }else{html='<div class="loading">该窗口无 Bedrock 费用</div>';}
+    if(d.tagValues.length){
+      html+=`<div class="muted" style="margin-top:8px">标签值拆分: ${
+        d.tagValues.map(t=>`${t.value}=${money(t.cost)}`).join(' · ')}</div>`;
+    }
+    if(d.note){html+=`<div class="muted" style="margin-top:8px">⚠️ ${d.note}</div>`;}
+    document.getElementById('ceTable').innerHTML=html;
+  }catch(e){m.textContent='';document.getElementById('ceTable').innerHTML=`<div class="err">查询失败: ${e.message}</div>`;}
 }
 function toggleErr(){
   if(!document.getElementById('errWrap'))return;

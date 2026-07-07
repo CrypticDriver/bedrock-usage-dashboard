@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.0 (2026-07-07)
+
+**新增**
+- 💰 Bedrock 真实账单面板(Cost Explorer):按当前日期窗口展示 Bedrock 总费用(UnblendedCost,非估算)、map-migrated 已打标/未打标金额与占比、账单服务行拆分、标签值拆分;按钮触发查询(每次 $0.01 CE API 费用)
+- IAM 新增 ce:GetCostAndUsage 权限
+
 ## 1.2.0 (2026-07-07)
 
 **新增**
