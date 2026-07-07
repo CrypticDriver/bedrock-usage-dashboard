@@ -62,6 +62,33 @@ def read_snapshot_cache():
         return json.loads(obj["Body"].read())
     except Exception:
         return None
+
+
+ALERT_STATE_KEY = "cache/alert-state.json"
+
+
+def read_alert_state():
+    """读推送节流状态(上次成功推送时间)。桶不可用时返回空=不节流,宁多勿漏。"""
+    if not CACHE_BUCKET:
+        return {}
+    try:
+        s3 = boto3.client("s3", region_name=LAMBDA_REGION)
+        return json.loads(s3.get_object(Bucket=CACHE_BUCKET, Key=ALERT_STATE_KEY)["Body"].read())
+    except Exception:
+        return {}
+
+
+def write_alert_state(state):
+    if not CACHE_BUCKET:
+        return False
+    try:
+        boto3.client("s3", region_name=LAMBDA_REGION).put_object(
+            Bucket=CACHE_BUCKET, Key=ALERT_STATE_KEY,
+            Body=json.dumps(state).encode(), ContentType="application/json")
+        return True
+    except Exception as e:
+        print(f"alert state write failed: {e}")
+        return False
 EDIT_KEY = os.environ.get("EDIT_KEY", "")
 PRICE_TTL = 60  # 单价缓存秒数
 DEFAULT_SESS = boto3.Session()  # 中心账号默认会话
@@ -325,6 +352,7 @@ def load_alerts():
         "window_hours": int(cfg.get("window_hours", 6) or 6),
         "region": str(cfg.get("region", "global") or "global"),
         "enabled": bool(cfg.get("enabled", False)),
+        "ignore_list": [str(x).strip() for x in (cfg.get("ignore_list") or []) if str(x).strip()][:100],
     }
 
 
@@ -335,6 +363,7 @@ def save_alerts(cfg):
         "window_hours": max(1, min(48, int(cfg.get("window_hours", 6) or 6))),
         "region": str(cfg.get("region", "global") or "global").strip() or "global",
         "enabled": bool(cfg.get("enabled", False)),
+        "ignore_list": [str(x).strip() for x in (cfg.get("ignore_list") or []) if str(x).strip()][:100],
     }
     if clean["webhook"] and not clean["webhook"].startswith("https://"):
         raise ValueError("webhook 必须是 https URL")
@@ -362,6 +391,17 @@ def dingtalk_send(webhook, sign_secret, title, text):
     return json.loads(urllib.request.urlopen(req, timeout=10).read().decode())
 
 
+def _is_ignored(model_id, patterns):
+    """忽略清单匹配: 精确 id, 或前缀通配(条目以 * 结尾, 如 global.*)。"""
+    for p in patterns:
+        if p.endswith("*"):
+            if model_id.startswith(p[:-1]):
+                return True
+        elif model_id == p:
+            return True
+    return False
+
+
 def run_alert_check(cfg=None, force_send=False):
     """扫描窗口内非 app-inference-profile 用量(不可分账),命中则推钉钉。"""
     cfg = cfg or load_alerts()
@@ -369,13 +409,22 @@ def run_alert_check(cfg=None, force_send=False):
     end = dt.datetime.now(dt.UTC)
     start = end - dt.timedelta(hours=hours)
     data = build_data(cfg.get("region", "global"), start, end)
-    bad = [r for r in data["rows"] if not is_taggable_profile(r["id"])]
+    raw_bad = [r for r in data["rows"] if not is_taggable_profile(r["id"])]
+    ignore = cfg.get("ignore_list") or []
+    bad = [r for r in raw_bad if not _is_ignored(r["id"], ignore)]
+    ignored_count = len(raw_bad) - len(bad)
     total_bad = round(sum(r["cost"] for r in bad), 2)
+    # 推送节流: 同一窗口只推一次(按 window_hours 对齐)。EventBridge 扫描频率照旧
+    # (定时任务还负责刷快照), 只是重叠窗口不再重复推送。0.9 容差防触发时刻抖动错过整槽。
+    state = read_alert_state()
+    since_last = end.timestamp() - float(state.get("last_sent_epoch", 0) or 0)
+    throttled = (not force_send) and bool(bad) and since_last < hours * 3600 * 0.9
     result = {"checked": True, "window_hours": hours, "region": cfg.get("region", "global"),
               "start": start.strftime("%Y-%m-%d %H:%M"), "end": end.strftime("%Y-%m-%d %H:%M"),
               "violations": bad, "violation_cost": total_bad,
+              "ignored_count": ignored_count, "throttled": throttled,
               "enabled": cfg.get("enabled", False), "sent": False, "send_error": ""}
-    should_send = bool(bad) and bool(cfg.get("webhook")) and (cfg.get("enabled") or force_send)
+    should_send = bool(bad) and bool(cfg.get("webhook")) and (cfg.get("enabled") or force_send) and not throttled
     if force_send and not bad and cfg.get("webhook"):
         should_send = True  # 手动测试时没命中也推一条,便于验证 webhook 通不通
     if should_send:
@@ -409,11 +458,16 @@ def run_alert_check(cfg=None, force_send=False):
                           "调用时改用其 ARN，费用即可按标签分账。")
         else:
             blocks.append("✅ 测试消息：当前窗口内未发现未分账用量。")
+        if ignored_count:
+            blocks.append(f"_已按忽略清单跳过 {ignored_count} 个模型_")
         try:
             resp = dingtalk_send(cfg["webhook"], cfg.get("sign_secret", ""),
                                  "Bedrock 分账告警", "\n\n".join(blocks))
             if resp.get("errcode") == 0:
                 result["sent"] = True
+                if bad:
+                    write_alert_state({"last_sent_epoch": end.timestamp(),
+                                       "last_sent": end.strftime("%Y-%m-%d %H:%M")})
             else:
                 result["send_error"] = f"dingtalk errcode={resp.get('errcode')} {resp.get('errmsg', '')}"
         except Exception as e:
@@ -1093,13 +1147,17 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
         </label>
         <label class="muted">区域 <input id="alRegion" value="global" style="width:120px"/></label>
         <label class="muted"><input type="checkbox" id="alEnabled"/> 启用定时检查</label>
+        <label class="muted" style="width:100%;display:block;margin-top:6px">忽略清单（每行一个模型/profile id，支持前缀通配符，如 <code>global.*</code>）
+          <textarea id="alIgnore" rows="3" style="width:100%;margin-top:4px" placeholder="global.anthropic.claude-sonnet-5&#10;us.*"></textarea>
+        </label>
         <button onclick="saveAlerts()">💾 保存</button>
         <button class="preset" onclick="testAlert()">🧪 立即检查并推送</button>
         <span id="alertSave" style="font-size:13px"></span>
       </div>
       <div class="muted" style="margin-top:12px;line-height:1.8">
         <b>规则:</b>只有 <b>application inference profile</b> 支持成本分配标签;窗口内若出现<b>直连模型ID / 系统跨区 profile</b>(us./global. 前缀)的用量即告警(无法分账)。
-        EventBridge 定时触发(默认每 6 小时);机器人安全设置建议「加签」,若用「自定义关键词」需包含 <b>Bedrock</b>。
+        EventBridge 定时扫描(默认每 6 小时,同时刷新快照);<b>推送按所选窗口节流</b>——同一窗口只推一条,选 12/24h 不会重复轰炸;忽略清单内的模型不参与告警。
+        机器人安全设置建议「加签」,若用「自定义关键词」需包含 <b>Bedrock</b>。
         配置存于 Secrets Manager <b>bedrock-dashboard/alerts</b>。
       </div>
     </div>
@@ -1273,7 +1331,8 @@ async function loadAlerts(){
     document.getElementById('alWindow').value=String(a.window_hours||6);
     document.getElementById('alRegion').value=a.region||'global';
     document.getElementById('alEnabled').checked=!!a.enabled;
-    document.getElementById('alertMeta').textContent=a.enabled?'✅ 定时检查已启用':'⏸ 定时检查未启用(保存时勾选「启用」)';
+    document.getElementById('alIgnore').value=(a.ignore_list||[]).join(String.fromCharCode(10));
+    document.getElementById('alertMeta').textContent=a.enabled?'✅ 定时检查已启用 · 同一窗口最多推送一条':'⏸ 定时检查未启用(保存时勾选「启用」)';
   }catch(e){document.getElementById('alertMeta').textContent='加载失败: '+e.message;}
 }
 async function saveAlerts(){
@@ -1282,7 +1341,8 @@ async function saveAlerts(){
     sign_secret:document.getElementById('alSecret').value.trim(),
     window_hours:parseInt(document.getElementById('alWindow').value,10),
     region:document.getElementById('alRegion').value.trim()||'global',
-    enabled:document.getElementById('alEnabled').checked};
+    enabled:document.getElementById('alEnabled').checked,
+    ignore_list:document.getElementById('alIgnore').value.split(String.fromCharCode(10)).map(s=>s.trim()).filter(Boolean)};
   try{
     const d=await getJSON(`?action=save_alerts&key=&alerts_json=${encodeURIComponent(JSON.stringify(cfg))}`);
     if(d.error)throw new Error(d.error);

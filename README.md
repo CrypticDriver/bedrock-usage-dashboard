@@ -10,7 +10,7 @@
 |------|------|
 | 📊 用量与成本 | 按模型展示输入 / 输出 / 缓存读写 token 与估算成本;按 UTC 天聚合,对齐账单口径 |
 | 🏷️ 分账视角 | 类型列区分**模型 ID / 系统跨区 profile / 应用推理 profile**(绿 = 可按标签分账);悬停任意行即显完整 ARN / ModelId |
-| 🔔 分账告警 | 发现无法分账的用量(未走 app inference profile)→ 推送**钉钉 webhook**(可加签);EventBridge 定时检查,页面可视化配置 |
+| 🔔 分账告警 | 发现无法分账的用量(未走 app inference profile)→ 推送**钉钉 webhook**(可加签);EventBridge 定时检查,页面可视化配置;支持忽略清单 + 按窗口节流防重复轰炸 |
 | 📸 快照秒开 | 定时任务把 7 天 global 数据快照到 S3,页面打开约 0.3s 出数;点「查询估算」才实时扫描 |
 | 🌍 区域 & global | 单区域查询,或跨全部已启用区域并发聚合;默认查近 7 天 |
 | 🏢 多账号 / 跨 Org | AssumeRole + ExternalId 纳管其他账号,页面一键生成接入命令,**不要求同一 Organization** |
@@ -83,7 +83,7 @@ DASH_PASS='你的登录密码' ./deploy.sh
 
 **多账号接入** — 看板 ⚙️ 配置 → 多账号接入 → 🎲 生成接入命令 → 粘到目标账号终端运行 → 把打印的 role ARN 填回页面。偏好 IaC 用 `onboard-account.yaml`(支持 StackSets)。跨账号角色仅含 CloudWatch / Bedrock 只读权限,ExternalId 防混淆代理。
 
-**分账告警** — ⚙️ 配置 → 🔔 分账告警:填钉钉机器人 webhook(安全设置建议「加签」,或关键词含 `Bedrock`)、窗口(6/12/24h)、勾「启用」保存;🧪 可立即触发一次(异步,结果推钉钉)。原理:只有 **application inference profile** 支持成本分配标签,窗口内出现模型 ID / 系统 profile 的用量即告警。
+**分账告警** — ⚙️ 配置 → 🔔 分账告警:填钉钉机器人 webhook(安全设置建议「加签」,或关键词含 `Bedrock`)、窗口(6/12/24h)、可选忽略清单(每行一个 id,支持前缀通配 `global.*`)、勾「启用」保存;🧪 可立即触发一次(异步,结果推钉钉,不受节流限制)。原理:只有 **application inference profile** 支持成本分配标签,窗口内出现模型 ID / 系统 profile 的用量即告警。扫描每 6h 一次(`ALERT_RATE` 可调),但**推送按所选窗口节流**——同一窗口只推一条,选 12/24h 不会重复告警同一笔用量。
 
 **单价** — ⚙️ 配置 → 单价配置,卡片式编辑(USD/1M tokens);匹配优先级:完整 ModelId > 家族关键字(opus/sonnet/haiku/fable/nova)。
 
