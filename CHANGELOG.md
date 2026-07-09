@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.2 (2026-07-09)
+
+**修复**
+- 跨账号角色支持自定义后缀:中心角色 AssumeRole 资源放宽为 `BedrockUsageReader*`;🎲 生成的接入命令角色名自动带随机后缀(`BedrockUsageReader-xxxx`),避免目标账号已被其他看板纳管时 create-role 撞名;`onboard-account.yaml` 新增 `ReaderRoleName` 参数
+- 场景:同一个账号要被多个看板(不同中心账号)纳管时,此前角色名写死 `BedrockUsageReader` 且中心角色只授权精确名字,第二个看板接入必然 AccessDenied(中心侧需 `git pull && ./deploy.sh` 更新后生效)
+
 ## 1.3.1 (2026-07-09)
 
 **修复**

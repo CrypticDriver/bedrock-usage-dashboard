@@ -4,6 +4,10 @@ Description: >
   在每个要纳管的账号里部署本模板(任意区域,IAM 为全局)。
 
 Parameters:
+  ReaderRoleName:
+    Type: String
+    Default: BedrockUsageReader
+    Description: 角色名(需以 BedrockUsageReader 开头;同账号被多个看板纳管时用后缀区分,如 BedrockUsageReader-team2)
   CentralRoleArn:
     Type: String
     Default: arn:aws:iam::CENTRAL_ACCOUNT_ID:role/CENTRAL_DASHBOARD_ROLE_NAME
@@ -17,7 +21,7 @@ Resources:
   BedrockUsageReader:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: BedrockUsageReader
+      RoleName: !Ref ReaderRoleName
       Description: Read-only Bedrock usage for central dashboard
       AssumeRolePolicyDocument:
         Version: '2012-10-17'

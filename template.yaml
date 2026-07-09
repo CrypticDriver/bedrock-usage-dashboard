@@ -105,7 +105,7 @@ Resources:
               - Sid: AssumeReaders
                 Effect: Allow
                 Action: sts:AssumeRole
-                Resource: arn:aws:iam::*:role/BedrockUsageReader
+                Resource: arn:aws:iam::*:role/BedrockUsageReader*
               - Sid: Secrets
                 Effect: Allow
                 Action:

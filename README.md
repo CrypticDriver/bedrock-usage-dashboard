@@ -30,7 +30,7 @@
 | Secrets Manager | `…/prices` 单价 · `…/accounts` 账号注册表 · `…/alerts` 告警配置 |
 | EventBridge Rule | 定时(默认 6h):分账检查 + 刷新快照 |
 | S3 缓存桶 | 私有,7 天生命周期,存 global 快照 |
-| BedrockUsageReader | 部署在被纳管账号的只读角色(`onboard-account.yaml`) |
+| BedrockUsageReader | 部署在被纳管账号的只读角色(`onboard-account.yaml`);角色名支持 `BedrockUsageReader*` 后缀,同一账号可被多个看板纳管 |
 
 <details>
 <summary>Mermaid 源</summary>
