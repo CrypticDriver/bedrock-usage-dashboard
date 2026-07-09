@@ -1105,7 +1105,6 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
       <select id="account"><option value="">本账号(中心)</option></select></div>
     <div class="field"><span>区域</span>
       <select id="region">
-        <option value="global">🌐 global(所有区聚合)</option>
         <option>us-west-2</option><option>us-east-1</option><option>us-east-2</option>
         <option>eu-central-1</option><option>ap-southeast-1</option><option>ap-northeast-1</option>
       </select></div>
@@ -1154,7 +1153,7 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
       <div class="cards" id="errCards"></div>
       <div id="errTable"></div>
       <div class="muted" style="margin-top:12px;line-height:1.7">
-        用当前「账号/区域/日期」(支持 global 聚合)。指标覆盖 <b>runtime 与 mantle 两种端点</b>,
+        用当前「账号/区域/日期」。指标覆盖 <b>runtime 与 mantle 两种端点</b>,
         且不受"调用日志是否开启"影响——这里能看到灰区面板(仅 runtime 日志)看不到的 server error 等。
         与灰区面板互补:此处看「有多少错」,灰区看「错的有没有计费 token」。
       </div>
@@ -1181,7 +1180,7 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
       <div class="muted" style="margin-top:12px;line-height:1.7">
         灰区 = 失败请求里已计费的 token:<b>输入</b>只要被模型处理就计费;<b>输出</b>为流式中途失败已产出的部分。
         用所选「账号/区域/日期」+ 上面日志组,基于 <b>Model Invocation Logging</b> 精确统计。
-        ⚠️ 仅 bedrock-runtime(mantle/Responses API 不被记录);需该区域已开启 invocation logging,且区域不能选 global。
+        ⚠️ 仅 bedrock-runtime(mantle/Responses API 不被记录);需该区域已开启 invocation logging。
       </div>
     </div>
   </div>
@@ -1272,7 +1271,7 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
   </div>
   </div>
   <div class="foot">v__DASH_VERSION__ · <a href="https://github.com/CrypticDriver/bedrock-usage-dashboard" style="color:#8b94b8">GitHub / 更新指南</a><br/>
-    数据源 CloudWatch AWS/Bedrock(Sum),按 <b>UTC 天</b>聚合(与 AWS 账单口径一致)。global 会扫描所有已启用区域并聚合。
+    数据源 CloudWatch AWS/Bedrock(Sum),按 <b>UTC 天</b>聚合(与 AWS 账单口径一致)。
     <br/><b>对账提示:</b>看板默认显示<b>原始 token 数</b>;AWS 账单 UsageQuantity 单位是<b>千 token</b>(= 看板数 ÷ 1000),切换上方「数量单位」即可对齐。
     账单里 cache-write 分 5min / 1h 两条,二者<b>之和</b> = 看板的 cacheW。
     应用推理配置自动反查底层模型;rerank/embedding 显示 UNKNOWN。
