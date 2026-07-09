@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.1 (2026-07-09)
+
+**修复**
+- 🎲 页面生成的接入命令 inline policy 补上 `ce:GetCostAndUsage`(1.3.0 只更新了中心角色和 onboard-account.yaml,漏了生成命令),否则命令接入的账号「真实账单」跨账号查询 AccessDenied
+
 ## 1.3.0 (2026-07-07)
 
 **新增**

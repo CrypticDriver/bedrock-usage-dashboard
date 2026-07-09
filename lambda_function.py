@@ -1562,7 +1562,7 @@ function genOnboard(){
   document.getElementById('aExt').value=ext;
   const central=window._central||'';
   const trust='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"'+central+'"},"Action":"sts:AssumeRole","Condition":{"StringEquals":{"sts:ExternalId":"'+ext+'"}}}]}';
-  const perm='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["cloudwatch:GetMetricData","cloudwatch:ListMetrics","bedrock:ListInferenceProfiles","bedrock:GetInferenceProfile"],"Resource":"*"}]}';
+  const perm='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["cloudwatch:GetMetricData","cloudwatch:ListMetrics","bedrock:ListInferenceProfiles","bedrock:GetInferenceProfile","ce:GetCostAndUsage"],"Resource":"*"}]}';
   const cmd='aws iam create-role --role-name BedrockUsageReader \\\n'
     +"  --assume-role-policy-document '"+trust+"' \\\n"
     +'  --query Role.Arn --output text\n'
