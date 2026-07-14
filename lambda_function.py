@@ -757,8 +757,16 @@ def gray_area(region, log_group, start, end, sess=None):
 def ce_cost(start, end, sess=None):
     ce = (sess or boto3).client("ce", region_name="us-east-1")
     s = start.date().isoformat()
+    # end 来自 _range,已是"不含"上界(选中末日+1天的 00:00);若带时间(被 now 截断)则向上取整到次日。
+    # 注意:不能再 +1 天,否则会多算一整天(v1.3.4 修复)。
+    if (end.hour, end.minute, end.second, end.microsecond) == (0, 0, 0, 0):
+        e_excl = end.date()
+    else:
+        e_excl = end.date() + dt.timedelta(days=1)
     today_next = dt.datetime.now(dt.UTC).date() + dt.timedelta(days=1)
-    e = min(end.date() + dt.timedelta(days=1), today_next).isoformat()
+    e_excl = min(e_excl, today_next)
+    e = e_excl.isoformat()
+    e_incl = (e_excl - dt.timedelta(days=1)).isoformat()  # 展示用:含的末日=用户选中的结束日
     resp = ce.get_cost_and_usage(
         TimePeriod={"Start": s, "End": e}, Granularity="MONTHLY",
         Metrics=["UnblendedCost"],
@@ -794,7 +802,7 @@ def ce_cost(start, end, sess=None):
     if total > 0 and tagged == 0:
         note = ("map-migrated 打标金额为 0:资源可能未打标,或该 tag 未在 Billing 控制台"
                 "激活为成本分配标签(激活后仅对之后产生的账单生效,历史不回填)")
-    return {"start": s, "end": e, "total": round(total, 2),
+    return {"start": s, "end": e_incl, "total": round(total, 2),
             "tagged": round(tagged, 2), "untagged": round(untagged, 2),
             "taggedPct": round(tagged / total * 100, 1) if total else 0.0,
             "byService": [{"service": k, "cost": round(v, 2)}
@@ -833,7 +841,7 @@ def ce_cost_all(start, end):
             rows.append({"account": t["accountId"] or central_id, "label": t["label"],
                          "error": str(e)[:200]})
     return {"start": meta.get("start", start.date().isoformat()),
-            "end": meta.get("end", end.date().isoformat()),
+            "end": meta.get("end", (end - dt.timedelta(seconds=1)).date().isoformat()),
             "total": round(total, 2), "tagged": round(tagged, 2),
             "untagged": round(untagged, 2),
             "taggedPct": round(tagged / total * 100, 1) if total else 0.0,
@@ -1363,7 +1371,7 @@ async function loadCe(){
   document.getElementById('ceCards').innerHTML='';document.getElementById('ceTable').innerHTML='';
   try{
     const d=await getJSON(`?format=cecost&${qs()}`);
-    m.textContent=`账单窗口 ${d.start} → ${d.end}(末日不含) · 全区域 · 全部账号`;
+    m.textContent=`账单窗口 ${d.start} → ${d.end}(含) · 全区域 · 全部账号`;
     const money=x=>'$'+Number(x).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
     document.getElementById('ceCards').innerHTML=`
       <div class="card hl"><div class="k">Bedrock 总费用</div><div class="v">${money(d.total)}</div></div>
