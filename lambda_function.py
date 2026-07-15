@@ -900,8 +900,9 @@ def _range(q):
             e = min(dt.datetime.fromisoformat(q["end"]).replace(tzinfo=dt.UTC) + dt.timedelta(days=1), now)
             if s < e:
                 return s, e
+            print(f"[_range] invalid range start={q.get('start')} end={q.get('end')}, falling back to default")
     except (TypeError, ValueError):
-        pass
+        print(f"[_range] unparsable dates start={q.get('start')!r} end={q.get('end')!r}, falling back to default")
     try:
         days = max(1, min(455, int(q.get("days", 30))))
     except (TypeError, ValueError):
@@ -1163,8 +1164,8 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
         <option>us-west-2</option><option>us-east-1</option><option>us-east-2</option>
         <option>eu-central-1</option><option>ap-southeast-1</option><option>ap-northeast-1</option>
       </select></div>
-    <div class="field"><span>开始 (UTC)</span><input type="date" id="start"/></div>
-    <div class="field"><span>结束 (UTC)</span><input type="date" id="end"/></div>
+    <div class="field"><span>开始 (UTC)</span><input type="date" id="start" onchange="dateChanged()"/></div>
+    <div class="field"><span>结束 (UTC)</span><input type="date" id="end" onchange="dateChanged()"/></div>
     <div class="field"><span>快捷范围</span>
       <div class="seg"><button onclick="preset(7)">7天</button><button onclick="preset(30)">30天</button><button onclick="preset(90)">90天</button></div></div>
     <button class="primary" onclick="window.__live=1;load()">🔍 查询估算</button>
@@ -1363,9 +1364,22 @@ function preset(days){
   load();
   loadCe();  // 账单与估算共用日期区间,联动刷新
 }
+// 无效区间必须在前端拦截: 后端 _range 对无效日期会静默回退默认 30 天,
+// 页面显示的窗口与所选日期对不上,用户无从察觉
+function checkRange(){
+  const s=document.getElementById('start').value, e=document.getElementById('end').value;
+  if(s&&e&&s>e){
+    document.getElementById('meta').innerHTML='<span class="err">⚠️ 开始日期晚于结束日期,请修正后再查询</span>';
+    document.getElementById('ceMeta').innerHTML='<span class="err">⚠️ 日期区间无效</span>';
+    return false;
+  }
+  return true;
+}
+function dateChanged(){ if(checkRange()){window.__live=1;load();loadCe();} }
 async function load(){
   const start=document.getElementById('start').value, end=document.getElementById('end').value;
   if(!start||!end){preset(7);return;}
+  if(!checkRange())return;
   document.getElementById('meta').textContent='加载中…';
   document.getElementById('cards').innerHTML='';
   document.getElementById('table').innerHTML='<div class="loading">⏳ 正在查询 CloudWatch…</div>';
@@ -1426,6 +1440,7 @@ function toggleCe(){
   document.getElementById('ceToggle').textContent=open?'收起 ▴':'展开 ▾';
 }
 async function loadCe(){
+  if(!checkRange())return;
   const m=document.getElementById('ceMeta');m.textContent='查询 Cost Explorer…';
   document.getElementById('ceCards').innerHTML='';document.getElementById('ceTable').innerHTML='';
   try{
