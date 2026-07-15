@@ -1151,8 +1151,26 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
   <h1>✦ Bedrock 用量 & 成本估算看板</h1>
   <div class="nav"><button class="preset" id="navBtn" onclick="toggleView()">⚙️ 配置</button></div>
   <div id="mainView">
+  <div class="panel">
+    <div class="phead" onclick="toggleCe()">
+      <h3>💰 Bedrock 真实账单 <span class="muted">· Cost Explorer · 跨账号 · 一账号一行 · map-migrated 拆分</span></h3>
+      <span class="chev" id="ceToggle">收起 ▴</span>
+    </div>
+    <div id="ceWrap">
+      <div class="chartbar" style="margin:12px 0">
+        <button onclick="loadCe()">刷新费用</button>
+        <span id="ceMeta" class="muted"></span>
+      </div>
+      <div class="cards" id="ceCards"></div>
+      <div id="ceTable"></div>
+      <div class="muted" style="margin-top:12px;line-height:1.7">
+        数据来自 <b>Cost Explorer 真实账单</b>(UnblendedCost,仅 Amazon Bedrock Service 账单行,非估算),一次查询覆盖<b>中心 + 全部注册账号</b>,区域/账号选择器不影响本面板。
+        map-migrated 拆分需要各账号已激活该成本分配标签;跨账号需 reader 角色有 ce:GetCostAndUsage。每账号每次查询产生 $0.02 CE API 费用。
+      </div>
+    </div>
+  </div>
   <div class="sub" id="meta">加载中…</div>
-  <div class="notice">⚠️&nbsp;<div><b>所有金额均为估算值,不是真实账单。</b>
+  <div class="notice">⚠️&nbsp;<div><b>以下为用量 &amp; 成本估算,不是真实账单。</b>
     基于 CloudWatch token 用量 × 单价(来自 Secrets Manager,读不到则用内置默认)推算。
     实际费用受 Batch 折扣、Provisioned Throughput、1M 上下文溢价等影响。
     <b>精确对账请以 AWS Cost Explorer / CUR 为准。</b></div></div>
@@ -1177,24 +1195,6 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
   </div>
   <div class="cards" id="cards"></div>
   <div id="table"></div>
-  <div class="panel">
-    <div class="phead" onclick="toggleCe()">
-      <h3>💰 Bedrock 真实账单 <span class="muted">· Cost Explorer · 跨账号 · 一账号一行 · map-migrated 拆分</span></h3>
-      <span class="chev" id="ceToggle">展开 ▾</span>
-    </div>
-    <div id="ceWrap" style="display:none">
-      <div class="chartbar" style="margin:12px 0">
-        <button onclick="loadCe()">查询费用</button>
-        <span id="ceMeta" class="muted"></span>
-      </div>
-      <div class="cards" id="ceCards"></div>
-      <div id="ceTable"></div>
-      <div class="muted" style="margin-top:12px;line-height:1.7">
-        数据来自 <b>Cost Explorer 真实账单</b>(UnblendedCost,仅 Amazon Bedrock Service 账单行,非估算),一次查询覆盖<b>中心 + 全部注册账号</b>,区域/账号选择器不影响本面板。
-        map-migrated 拆分需要各账号已激活该成本分配标签;跨账号需 reader 角色有 ce:GetCostAndUsage。每账号每次查询产生 $0.02 CE API 费用。
-      </div>
-    </div>
-  </div>
   <!--OPS_PANELS_START-->
   <div class="panel">
     <div class="phead" onclick="toggleErr()">
@@ -1716,6 +1716,7 @@ function renderChart(pts){
     <polyline points="${line}" fill="none" stroke="#34d399" stroke-width="2"/>${dots}${xl}</svg>`;
 }
 preset(7);
+loadCe();
 loadPrices();
 loadAccounts();
 </script>
