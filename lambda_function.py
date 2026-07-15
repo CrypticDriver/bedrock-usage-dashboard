@@ -1163,11 +1163,6 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
     <div class="field"><span>结束 (UTC)</span><input type="date" id="end"/></div>
     <div class="field"><span>快捷范围</span>
       <div class="seg"><button onclick="preset(7)">7天</button><button onclick="preset(30)">30天</button><button onclick="preset(90)">90天</button></div></div>
-    <div class="field"><span>数量单位</span>
-      <select id="unit" onchange="renderMain()">
-        <option value="1">原始 token</option>
-        <option value="1000">千 token(账单口径)</option>
-      </select></div>
     <button class="primary" onclick="window.__live=1;load()">🔍 查询估算</button>
   </div>
   <div class="panel">
@@ -1328,7 +1323,7 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
   </div>
   <div class="foot">v__DASH_VERSION__ · <a href="https://github.com/CrypticDriver/bedrock-usage-dashboard" style="color:#8b94b8">GitHub / 更新指南</a><br/>
     数据源 CloudWatch AWS/Bedrock(Sum),按 <b>UTC 天</b>聚合(与 AWS 账单口径一致)。
-    <br/><b>对账提示:</b>看板默认显示<b>原始 token 数</b>;AWS 账单 UsageQuantity 单位是<b>千 token</b>(= 看板数 ÷ 1000),切换上方「数量单位」即可对齐。
+    <br/><b>对账提示:</b>看板显示<b>原始 token 数</b>;AWS 账单 UsageQuantity 单位是<b>千 token</b>(= 看板数 ÷ 1000)。
     账单里 cache-write 分 5min / 1h 两条,二者<b>之和</b> = 看板的 cacheW。
     应用推理配置自动反查底层模型;rerank/embedding 显示 UNKNOWN。
     单价改在 Secrets Manager 密钥 <b>bedrock-dashboard/prices</b> 维护。
@@ -1371,13 +1366,11 @@ async function load(){
     document.getElementById('table').innerHTML=`<div class="err">查询失败: ${e.message}</div>`;
   }
 }
-function tok(n){const u=+document.getElementById('unit').value;
-  return u===1000?(n/1000).toLocaleString('en-US',{maximumFractionDigits:3}):fmt(n);}
+function tok(n){return fmt(n);}
 function renderMain(){
   const d=window._d; if(!d)return;
-  const unitTxt=(+document.getElementById('unit').value===1000)?'千token(账单口径)':'原始token';
   document.getElementById('meta').textContent=
-    `区域 ${d.region} · ${d.start}Z → ${d.end}Z (≈${d.days}天, UTC) · ${d.rows.length} 模型 · 单价来源: ${d.price_source} · 数量单位: ${unitTxt} · 估算`;
+    `区域 ${d.region} · ${d.start}Z → ${d.end}Z (≈${d.days}天, UTC) · ${d.rows.length} 模型 · 单价来源: ${d.price_source} · 估算`;
   const tIn=d.rows.reduce((s,x)=>s+x.in+x.cache_read+x.cache_write,0);
   const tOut=d.rows.reduce((s,x)=>s+x.out,0);
   document.getElementById('cards').innerHTML=`
