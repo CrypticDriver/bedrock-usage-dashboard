@@ -1134,6 +1134,7 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
 .field{display:flex;flex-direction:column;gap:6px}
 .field>span{font-size:10px;letter-spacing:.5px;text-transform:uppercase;color:#8b94b8;padding-left:2px}
 .field select,.field input{height:38px}
+#account{max-width:260px;text-overflow:ellipsis}
 .seg{display:flex;border:1px solid rgba(255,255,255,.16);border-radius:10px;overflow:hidden;height:38px}
 .seg button{background:rgba(255,255,255,.05);color:#cdd6ff;border:none;
   border-right:1px solid rgba(255,255,255,.12);padding:0 15px;height:38px;border-radius:0;font-weight:500}
