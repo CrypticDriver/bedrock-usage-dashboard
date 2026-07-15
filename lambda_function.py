@@ -424,20 +424,19 @@ def run_alert_check(cfg=None, force_send=False):
     # (定时任务还负责刷快照), 只是重叠窗口不再重复推送。0.9 容差防触发时刻抖动错过整槽。
     state = read_alert_state()
     since_last = end.timestamp() - float(state.get("last_sent_epoch", 0) or 0)
-    throttled = (not force_send) and bool(bad) and since_last < hours * 3600 * 0.9
+    throttled = (not force_send) and since_last < hours * 3600 * 0.9
     result = {"checked": True, "window_hours": hours, "region": cfg.get("region", "global"),
               "start": start.strftime("%Y-%m-%d %H:%M"), "end": end.strftime("%Y-%m-%d %H:%M"),
               "violations": bad, "violation_cost": total_bad,
               "ignored_count": ignored_count, "throttled": throttled,
               "enabled": cfg.get("enabled", False), "sent": False, "send_error": ""}
-    should_send = bool(bad) and bool(cfg.get("webhook")) and (cfg.get("enabled") or force_send) and not throttled
-    if force_send and not bad and cfg.get("webhook"):
-        should_send = True  # 手动测试时没命中也推一条,便于验证 webhook 通不通
+    # 无发现也推巡检报告(每窗口一条心跳,链路通断一目了然);节流对两种消息同样生效
+    should_send = bool(cfg.get("webhook")) and (cfg.get("enabled") or force_send) and not throttled
+    if force_send and cfg.get("webhook"):
+        should_send = True  # 手动测试不受节流限制,便于验证 webhook 通不通
     # 未发送时把原因打出来(否则"没报错日志"其实是静默跳过)
     if not should_send:
         reasons = []
-        if not bad and not force_send:
-            reasons.append("no_violations")
         if not cfg.get("webhook"):
             reasons.append("webhook_empty")
         if not (cfg.get("enabled") or force_send):
@@ -460,7 +459,7 @@ def run_alert_check(cfg=None, force_send=False):
                     return name[len(p):].replace("anthropic.", ""), f"{p[:-1]} 跨区 profile"
             return name.replace("anthropic.", ""), "直连模型 ID"
 
-        blocks = ["## 🚨 Bedrock 分账告警",
+        blocks = [f"## {'🚨 Bedrock 分账告警' if bad else '✅ Bedrock 分账巡检'}",
                   f"**近 {hours} 小时**（{result['start']} – {result['end']} UTC · {result['region']}）"]
         if bad:
             blocks.append(f"共 **{len(bad)}** 个模型未走 app inference profile，"
@@ -476,18 +475,21 @@ def run_alert_check(cfg=None, force_send=False):
             blocks.append("> 💡 为每个应用创建 **application inference profile**，"
                           "调用时改用其 ARN，费用即可按标签分账。")
         else:
-            blocks.append("✅ 测试消息：当前窗口内未发现未分账用量。")
+            blocks.append("当前窗口内未发现未分账用量，全部调用均可正常分账。"
+                          if not force_send else "✅ 测试消息：当前窗口内未发现未分账用量。")
         if ignored_count:
             blocks.append(f"_已按忽略清单跳过 {ignored_count} 个模型_")
         print(f"[dingtalk] sending: has_secret={bool(cfg.get('sign_secret'))}, "
               f"violations={len(bad)}, force_send={force_send}")
         try:
             resp = dingtalk_send(cfg["webhook"], cfg.get("sign_secret", ""),
-                                 "Bedrock 分账告警", "\n\n".join(blocks))
+                                 "Bedrock 分账告警" if bad else "Bedrock 分账巡检",
+                                 "\n\n".join(blocks))
             if resp.get("errcode") == 0:
                 result["sent"] = True
                 print("[dingtalk] OK errcode=0")
-                if bad:
+                if not force_send:
+                    # 心跳/告警都计入节流窗口;手动测试不占槽,避免测完把定时推送挤掉
                     write_alert_state({"last_sent_epoch": end.timestamp(),
                                        "last_sent": end.strftime("%Y-%m-%d %H:%M")})
             else:
