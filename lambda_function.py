@@ -459,11 +459,11 @@ def run_alert_check(cfg=None, force_send=False):
                     return name[len(p):].replace("anthropic.", ""), f"{p[:-1]} 跨区 profile"
             return name.replace("anthropic.", ""), "直连模型 ID"
 
-        blocks = [f"## {'🚨 Bedrock 分账告警' if bad else '✅ Bedrock 分账巡检'}",
+        blocks = [f"## {'🚨 Bedrock 无标签用量告警' if bad else '✅ Bedrock 用量巡检'}",
                   f"**近 {hours} 小时**（{result['start']} – {result['end']} UTC · {result['region']}）"]
         if bad:
             blocks.append(f"共 **{len(bad)}** 个模型未走 app inference profile，"
-                          f"**≈ ${total_bad}** 无法按标签分账：")
+                          f"**≈ ${total_bad}** 无法按标签归属：")
             items = []
             for i, r in enumerate(bad[:10], 1):
                 name, kind = _label(r["model"])
@@ -473,17 +473,17 @@ def run_alert_check(cfg=None, force_send=False):
                 items.append(f"…等共 {len(bad)} 个模型")
             blocks.append("\n\n".join(items))
             blocks.append("> 💡 为每个应用创建 **application inference profile**，"
-                          "调用时改用其 ARN，费用即可按标签分账。")
+                          "调用时改用其 ARN，用量与费用即可按标签归属。")
         else:
-            blocks.append("当前窗口内未发现未分账用量，全部调用均可正常分账。"
-                          if not force_send else "✅ 测试消息：当前窗口内未发现未分账用量。")
+            blocks.append("当前窗口内未发现无标签用量，全部调用均带标签可归属。"
+                          if not force_send else "✅ 测试消息：当前窗口内未发现无标签用量。")
         if ignored_count:
             blocks.append(f"_已按忽略清单跳过 {ignored_count} 个模型_")
         print(f"[dingtalk] sending: has_secret={bool(cfg.get('sign_secret'))}, "
               f"violations={len(bad)}, force_send={force_send}")
         try:
             resp = dingtalk_send(cfg["webhook"], cfg.get("sign_secret", ""),
-                                 "Bedrock 分账告警" if bad else "Bedrock 分账巡检",
+                                 "Bedrock 无标签用量告警" if bad else "Bedrock 用量巡检",
                                  "\n\n".join(blocks))
             if resp.get("errcode") == 0:
                 result["sent"] = True
