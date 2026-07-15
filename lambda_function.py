@@ -1187,13 +1187,21 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
       </div>
     </div>
   </div>
-  <div class="sub" id="meta">加载中…</div>
-  <div class="notice">⚠️&nbsp;<div><b>以下为用量 &amp; 成本估算,不是真实账单。</b>
-    基于 CloudWatch token 用量 × 单价(来自 Secrets Manager,读不到则用内置默认)推算。
-    实际费用受 Batch 折扣、Provisioned Throughput、1M 上下文溢价等影响。
-    <b>精确对账请以上方 Cost Explorer 真实账单为准。</b></div></div>
-  <div class="cards" id="cards"></div>
-  <div id="table"></div>
+  <div class="panel">
+    <div class="phead" onclick="toggleEst()">
+      <h3>📊 用量 &amp; 成本估算 <span class="muted">· CloudWatch token 用量 × 单价 · 非账单</span></h3>
+      <span class="chev" id="estToggle">收起 ▴</span>
+    </div>
+    <div id="estWrap">
+      <div class="sub" id="meta" style="margin:12px 0 10px">加载中…</div>
+      <div class="cards" id="cards"></div>
+      <div id="table"></div>
+      <div class="muted" style="margin-top:12px;line-height:1.7">
+        ⚠️ 估算值,非真实账单:基于 CloudWatch token 用量 × 单价(Secrets Manager,读不到用内置默认)推算,
+        实际费用受 Batch 折扣、Provisioned Throughput、1M 上下文溢价等影响。<b>精确对账以上方 Cost Explorer 真实账单为准。</b>
+      </div>
+    </div>
+  </div>
   <!--OPS_PANELS_START-->
   <div class="panel">
     <div class="phead" onclick="toggleErr()">
@@ -1406,6 +1414,11 @@ function toggleGray(){
   w.style.display=open?'block':'none';
   document.getElementById('grayToggle').textContent=open?'收起 ▴':'展开 ▾';
   if(open) grayPickRegion();
+}
+function toggleEst(){
+  var w=document.getElementById('estWrap'),open=w.style.display==='none';
+  w.style.display=open?'block':'none';
+  document.getElementById('estToggle').textContent=open?'收起 ▴':'展开 ▾';
 }
 function toggleCe(){
   var w=document.getElementById('ceWrap'),open=w.style.display==='none';
