@@ -763,14 +763,19 @@ def ce_cost(start, end, sess=None):
         TimePeriod={"Start": s, "End": e}, Granularity="MONTHLY",
         Metrics=["UnblendedCost"],
         GroupBy=[{"Type": "DIMENSION", "Key": "SERVICE"}])
+    all_services = []
     by_service = {}
     for period in resp.get("ResultsByTime", []):
         for g in period.get("Groups", []):
             name = g["Keys"][0]
-            if name != "Amazon Bedrock Service":
-                continue
             amt = float(g["Metrics"]["UnblendedCost"]["Amount"])
+            all_services.append((name, amt))
+            if "amazon bedrock" not in name.lower():
+                continue
             by_service[name] = by_service.get(name, 0.0) + amt
+    if not by_service and all_services:
+        print(f"[ce_cost] no bedrock match ({s}~{e}); services="
+              + json.dumps(sorted(all_services, key=lambda x: -x[1])[:20], ensure_ascii=False))
     total = sum(by_service.values())
     tagged = untagged = 0.0
     tag_values = {}
@@ -830,6 +835,7 @@ def ce_cost_all(start, end):
             tagged += d["tagged"]
             untagged += d["untagged"]
         except Exception as e:
+            print(f"[ce_cost_all] account={t['accountId'] or central_id} FAILED: {e!r}")
             rows.append({"account": t["accountId"] or central_id, "label": t["label"],
                          "error": str(e)[:200]})
     return {"start": meta.get("start", start.date().isoformat()),
