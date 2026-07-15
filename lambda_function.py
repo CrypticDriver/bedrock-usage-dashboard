@@ -1395,8 +1395,12 @@ async function load(){
 function tok(n){return fmt(n);}
 function renderMain(){
   const d=window._d; if(!d)return;
+  // 后端把结束日 +1 天作为排他查询边界(07-14 全天 = 查到 07-15 00:00),
+  // 展示需减回并标注(含),与所选日期及真实账单面板口径一致
+  const endD=new Date(d.end.slice(0,10)+'T00:00:00Z');
+  const endShown=d.end.endsWith('00:00')?iso(new Date(endD-86400000))+'(含)':d.end+'Z';
   document.getElementById('meta').textContent=
-    `区域 ${d.region} · ${d.start}Z → ${d.end}Z (≈${d.days}天, UTC) · ${d.rows.length} 模型 · 单价来源: ${d.price_source} · 估算`;
+    `区域 ${d.region} · ${d.start.slice(0,10)} → ${endShown} (UTC) · ${d.rows.length} 模型 · 单价来源: ${d.price_source} · 估算`;
   const tIn=d.rows.reduce((s,x)=>s+x.in+x.cache_read+x.cache_write,0);
   const tOut=d.rows.reduce((s,x)=>s+x.out,0);
   document.getElementById('cards').innerHTML=`
