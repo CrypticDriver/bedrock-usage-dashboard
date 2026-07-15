@@ -10,6 +10,7 @@ Bedrock 用量/成本估算看板 — 单 Lambda(HTML + JSON + 趋势数据)
 import os
 import json
 import time
+import traceback
 import datetime as dt
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -427,6 +428,19 @@ def run_alert_check(cfg=None, force_send=False):
     should_send = bool(bad) and bool(cfg.get("webhook")) and (cfg.get("enabled") or force_send) and not throttled
     if force_send and not bad and cfg.get("webhook"):
         should_send = True  # 手动测试时没命中也推一条,便于验证 webhook 通不通
+    # 未发送时把原因打出来(否则"没报错日志"其实是静默跳过)
+    if not should_send:
+        reasons = []
+        if not bad and not force_send:
+            reasons.append("no_violations")
+        if not cfg.get("webhook"):
+            reasons.append("webhook_empty")
+        if not (cfg.get("enabled") or force_send):
+            reasons.append("disabled(enabled=false)")
+        if throttled:
+            reasons.append(f"throttled(since_last={int(since_last)}s < {int(hours * 3600 * 0.9)}s)")
+        print(f"[dingtalk] SKIP send: {', '.join(reasons) or 'unknown'} "
+              f"(force_send={force_send}, has_secret={bool(cfg.get('sign_secret'))})")
     if should_send:
         def _tok(n):
             if n >= 1_000_000:
@@ -460,18 +474,26 @@ def run_alert_check(cfg=None, force_send=False):
             blocks.append("✅ 测试消息：当前窗口内未发现未分账用量。")
         if ignored_count:
             blocks.append(f"_已按忽略清单跳过 {ignored_count} 个模型_")
+        print(f"[dingtalk] sending: has_secret={bool(cfg.get('sign_secret'))}, "
+              f"violations={len(bad)}, force_send={force_send}")
         try:
             resp = dingtalk_send(cfg["webhook"], cfg.get("sign_secret", ""),
                                  "Bedrock 分账告警", "\n\n".join(blocks))
             if resp.get("errcode") == 0:
                 result["sent"] = True
+                print("[dingtalk] OK errcode=0")
                 if bad:
                     write_alert_state({"last_sent_epoch": end.timestamp(),
                                        "last_sent": end.strftime("%Y-%m-%d %H:%M")})
             else:
                 result["send_error"] = f"dingtalk errcode={resp.get('errcode')} {resp.get('errmsg', '')}"
+                # 钉钉业务失败: HTTP 200 但 errcode!=0(如 310000 加签/关键词错配),强制落日志
+                print(f"[dingtalk] FAIL {result['send_error']} | resp={json.dumps(resp, ensure_ascii=False)}")
         except Exception as e:
             result["send_error"] = str(e)[:300]
+            # 网络/超时/URL/JSON 解析等异常,原本只塞进返回值不打日志
+            print(f"[dingtalk] EXCEPTION {type(e).__name__}: {e}")
+            traceback.print_exc()
     return result
 
 
