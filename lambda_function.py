@@ -345,7 +345,9 @@ def load_alerts():
     sm = boto3.client("secretsmanager", region_name=LAMBDA_REGION)
     try:
         cfg = json.loads(sm.get_secret_value(SecretId=ALERTS_SECRET)["SecretString"])
-    except Exception:
+    except Exception as e:
+        # secret 读不到时告警配置整体为空(不发且此前无日志),这里必须留痕
+        print(f"[load_alerts] read secret FAILED: {e!r}")
         cfg = {}
     return {
         "webhook": str(cfg.get("webhook", "") or ""),
@@ -407,6 +409,9 @@ def run_alert_check(cfg=None, force_send=False):
     """扫描窗口内非 app-inference-profile 用量(不可分账),命中则推钉钉。"""
     cfg = cfg or load_alerts()
     hours = max(1, min(48, int(cfg.get("window_hours", 6))))
+    print(f"[alert_check] start: region={cfg.get('region', 'global')}, window={hours}h, "
+          f"enabled={bool(cfg.get('enabled'))}, has_webhook={bool(cfg.get('webhook'))}, "
+          f"has_secret={bool(cfg.get('sign_secret'))}, force_send={force_send}")
     end = dt.datetime.now(dt.UTC)
     start = end - dt.timedelta(hours=hours)
     data = build_data(cfg.get("region", "global"), start, end)
@@ -579,14 +584,19 @@ def region_tokens(region, start, end, sess=None):
 
 
 def build_data(region, start, end, sess=None):
+    t0 = time.monotonic()
     regions = regions_for(region)
+    failed = []
     agg = {}
     with ThreadPoolExecutor(max_workers=min(18, len(regions))) as ex:
         futs = {ex.submit(region_tokens, r, start, end, sess): r for r in regions}
         for f in as_completed(futs):
             try:
                 res = f.result()
-            except Exception:
+            except Exception as e:
+                # 单区失败原本静默跳过,导致数据缺块无迹可查
+                failed.append(futs[f])
+                print(f"[build_data] region {futs[f]} FAILED: {e!r}")
                 continue
             for mid, t in res.items():
                 a = agg.setdefault(mid, dict.fromkeys(METRICS.values(), 0.0))
@@ -611,6 +621,8 @@ def build_data(region, start, end, sess=None):
                      "cache_read": int(t["cache_read"]), "cache_write": int(t["cache_write"]),
                      "cost": round(cost, 2), "price": src})
     rows.sort(key=lambda x: x["cost"], reverse=True)
+    print(f"[build_data] {region}: {len(regions)} regions in {time.monotonic() - t0:.1f}s, "
+          f"{len(rows)} models{', FAILED: ' + ','.join(failed) if failed else ''}")
     _, psource = load_prices()
     return {"region": region, "days": round((end - start).total_seconds() / 86400, 1),
             "start": start.strftime("%Y-%m-%d %H:%M"), "end": end.strftime("%Y-%m-%d %H:%M"),
@@ -907,13 +919,19 @@ def lambda_handler(event, context):
         return {"cache_refreshed": write_snapshot_cache()}
     if isinstance(event, dict) and not event.get("queryStringParameters") and (
             event.get("action") == "alert_check" or event.get("source") == "aws.events"):
+        t0 = time.monotonic()
         result = run_alert_check(force_send=bool(event.get("force")))
         print(json.dumps({"alert_check": {k: v for k, v in result.items() if k != "violations"},
                           "violation_count": len(result.get("violations", []))}, ensure_ascii=False))
+        # 超时排查: alert_check 与快照刷新各占多久,剩余多少毫秒
+        print(f"[alert_check] done in {time.monotonic() - t0:.1f}s, "
+              f"remaining={context.get_remaining_time_in_millis() if context else '?'}ms; snapshot refresh next")
+        t1 = time.monotonic()
         try:
             result["cache_refreshed"] = write_snapshot_cache()
+            print(f"[snapshot] refreshed in {time.monotonic() - t1:.1f}s")
         except Exception as e:
-            print(f"cache refresh failed: {e}")
+            print(f"cache refresh failed: {e!r}")
         return result
     q = (event.get("queryStringParameters") or {}) if isinstance(event, dict) else {}
     q = q or {}
