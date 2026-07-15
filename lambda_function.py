@@ -1128,13 +1128,16 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
 #editKey{width:210px}
 .savebar button{padding:9px 22px}
 .nav{display:flex;justify-content:flex-end;gap:10px;margin:-6px 0 18px}
-.toolbar{display:flex;flex-wrap:wrap;gap:14px 16px;align-items:flex-end;
+.toolbar{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;
   background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.12);
   border-radius:16px;padding:16px 18px;margin-bottom:22px;backdrop-filter:blur(14px)}
 .field{display:flex;flex-direction:column;gap:6px}
 .field>span{font-size:10px;letter-spacing:.5px;text-transform:uppercase;color:#8b94b8;padding-left:2px}
 .field select,.field input{height:38px}
-#account{max-width:260px;text-overflow:ellipsis}
+#account{max-width:190px;text-overflow:ellipsis}
+#region{max-width:150px}
+.toolbar input[type=date]{width:140px}
+.toolbar .seg button{padding:0 12px}
 .seg{display:flex;border:1px solid rgba(255,255,255,.16);border-radius:10px;overflow:hidden;height:38px}
 .seg button{background:rgba(255,255,255,.05);color:#cdd6ff;border:none;
   border-right:1px solid rgba(255,255,255,.12);padding:0 15px;height:38px;border-radius:0;font-weight:500}
