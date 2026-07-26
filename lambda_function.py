@@ -90,6 +90,40 @@ def write_alert_state(state):
     except Exception as e:
         print(f"alert state write failed: {e}")
         return False
+SETTINGS_KEY = "cache/settings.json"
+_settings_cache = None
+
+
+def load_settings():
+    """看板设置(map-migrated 期望标签值等), 存 S3。读不到返回默认。"""
+    global _settings_cache
+    if _settings_cache is not None:
+        return _settings_cache
+    cfg = {}
+    if CACHE_BUCKET:
+        try:
+            s3 = boto3.client("s3", region_name=LAMBDA_REGION)
+            cfg = json.loads(s3.get_object(
+                Bucket=CACHE_BUCKET, Key=SETTINGS_KEY)["Body"].read())
+        except Exception:
+            cfg = {}
+    _settings_cache = {"map_tag_value": str(cfg.get("map_tag_value", "") or "")}
+    return _settings_cache
+
+
+def save_settings(cfg):
+    """校验并保存看板设置。map_tag_value 保存时 strip, 避免设置本身带空格复刻客户的坑。"""
+    global _settings_cache
+    clean = {"map_tag_value": str(cfg.get("map_tag_value", "") or "").strip()[:256]}
+    if not CACHE_BUCKET:
+        raise ValueError("未配置 CACHE_BUCKET, 无法保存设置")
+    boto3.client("s3", region_name=LAMBDA_REGION).put_object(
+        Bucket=CACHE_BUCKET, Key=SETTINGS_KEY,
+        Body=json.dumps(clean).encode(), ContentType="application/json")
+    _settings_cache = clean
+    return clean
+
+
 EDIT_KEY = os.environ.get("EDIT_KEY", "")
 PRICE_TTL = 60  # 单价缓存秒数
 DEFAULT_SESS = boto3.Session()  # 中心账号默认会话
@@ -790,7 +824,7 @@ def gray_area(region, log_group, start, end, sess=None):
             "rows": rows}
 
 
-def ce_cost(start, end, sess=None):
+def ce_cost(start, end, sess=None, expected=None):
     ce = (sess or boto3).client("ce", region_name="us-east-1")
     s = start.date().isoformat()
     # end 来自 _range,已是"不含"上界(选中末日+1天的 00:00);若带时间(被 now 截断)则向上取整到次日。
@@ -821,8 +855,9 @@ def ce_cost(start, end, sess=None):
         print(f"[ce_cost] no bedrock match ({s}~{e}); services="
               + json.dumps(sorted(all_services, key=lambda x: -x[1])[:20], ensure_ascii=False))
     total = sum(by_service.values())
-    tagged = untagged = 0.0
+    tagged = untagged = mistagged = 0.0
     tag_values = {}
+    mis_values = {}
     if by_service:
         resp2 = ce.get_cost_and_usage(
             TimePeriod={"Start": s, "End": e}, Granularity="MONTHLY",
@@ -834,22 +869,38 @@ def ce_cost(start, end, sess=None):
                 key = g["Keys"][0]
                 amt = float(g["Metrics"]["UnblendedCost"]["Amount"])
                 val = key.split("$", 1)[1] if "$" in key else ""
-                if val:
+                if not val:
+                    untagged += amt
+                elif expected and val != expected:
+                    # 打了标但值与设定值不符(常见: 多敲了空格) → 无效打标
+                    mistagged += amt
+                    mis_values[val] = mis_values.get(val, 0.0) + amt
+                else:
                     tagged += amt
                     tag_values[val] = tag_values.get(val, 0.0) + amt
-                else:
-                    untagged += amt
     note = ""
-    if total > 0 and tagged == 0:
+    if total > 0 and tagged == 0 and mistagged == 0:
         note = ("map-migrated 打标金额为 0:资源可能未打标,或该 tag 未在 Billing 控制台"
                 "激活为成本分配标签(激活后仅对之后产生的账单生效,历史不回填)")
+
+    def _mis_reason(v):
+        if not expected:
+            return ""
+        if v.strip() == expected:
+            return "首尾多了空格"
+        if v.strip().lower() == expected.lower():
+            return "大小写不一致"
+        return "值不匹配"
     return {"start": s, "end": e_incl, "total": round(total, 2),
             "tagged": round(tagged, 2), "untagged": round(untagged, 2),
+            "mistagged": round(mistagged, 2), "expectedTag": expected or "",
             "taggedPct": round(tagged / total * 100, 1) if total else 0.0,
             "byService": [{"service": k, "cost": round(v, 2)}
                           for k, v in sorted(by_service.items(), key=lambda x: -x[1])],
             "tagValues": [{"value": k, "cost": round(v, 2)}
                           for k, v in sorted(tag_values.items(), key=lambda x: -x[1])],
+            "misValues": [{"value": k, "cost": round(v, 2), "reason": _mis_reason(k)}
+                          for k, v in sorted(mis_values.items(), key=lambda x: -x[1])],
             "note": note}
 
 
@@ -866,18 +917,27 @@ def ce_cost_all(start, end):
             continue
         targets.append({"accountId": a["accountId"],
                         "label": a.get("label") or a["accountId"]})
-    total = tagged = untagged = 0.0
+    total = tagged = untagged = mistagged = 0.0
+    expected = load_settings().get("map_tag_value", "")
+    mis_agg = {}
     meta = {}
     for t in targets:
         try:
-            d = ce_cost(start, end, session_for(t["accountId"]))
+            d = ce_cost(start, end, session_for(t["accountId"]), expected)
             meta = d
             rows.append({"account": t["accountId"] or central_id, "label": t["label"],
                          "total": d["total"], "tagged": d["tagged"],
-                         "untagged": d["untagged"], "taggedPct": d["taggedPct"]})
+                         "untagged": d["untagged"], "mistagged": d["mistagged"],
+                         "taggedPct": d["taggedPct"]})
             total += d["total"]
             tagged += d["tagged"]
             untagged += d["untagged"]
+            mistagged += d["mistagged"]
+            for v in d.get("misValues", []):
+                if v["value"] in mis_agg:
+                    mis_agg[v["value"]]["cost"] = round(mis_agg[v["value"]]["cost"] + v["cost"], 2)
+                else:
+                    mis_agg[v["value"]] = dict(v)
         except Exception as e:
             print(f"[ce_cost_all] account={t['accountId'] or central_id} FAILED: {e!r}")
             rows.append({"account": t["accountId"] or central_id, "label": t["label"],
@@ -886,10 +946,12 @@ def ce_cost_all(start, end):
             "end": meta.get("end", (end - dt.timedelta(seconds=1)).date().isoformat()),
             "total": round(total, 2), "tagged": round(tagged, 2),
             "untagged": round(untagged, 2),
+            "mistagged": round(mistagged, 2), "expectedTag": expected,
+            "misValues": sorted(mis_agg.values(), key=lambda x: -x["cost"]),
             "taggedPct": round(tagged / total * 100, 1) if total else 0.0,
             "rows": rows,
             "note": ("map-migrated 拆分需要各账号已将该 tag 激活为成本分配标签"
-                     "(激活后仅对新账单生效,历史不回填)" if total > 0 and tagged == 0 else "")}
+                     "(激活后仅对新账单生效,历史不回填)" if total > 0 and tagged == 0 and mistagged == 0 else "")}
 
 
 def _range(q):
@@ -970,6 +1032,16 @@ def lambda_handler(event, context):
             lst = [x for x in load_accounts() if x.get("accountId") != q.get("accountId")]
             save_accounts(lst)
             return _json({"ok": True})
+        if fmt == "settings":
+            return _json({"settings": load_settings(), "editable": True})
+        if q.get("action") == "save_settings":
+            if EDIT_KEY and q.get("key") != EDIT_KEY:
+                return _json({"error": "编辑密钥无效"}, 403)
+            try:
+                cfg = save_settings(json.loads(q.get("settings_json", "{}")))
+            except Exception as e:
+                return _json({"error": str(e)}, 400)
+            return _json({"ok": True, "settings": cfg})
         if fmt == "alerts":
             return _json({"alerts": load_alerts(), "editable": True})
         if q.get("action") == "save_alerts":
@@ -1176,6 +1248,13 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
       <span class="chev" id="ceToggle">收起 ▴</span>
     </div>
     <div id="ceWrap">
+      <div class="savebar" style="flex-wrap:wrap;margin:12px 0 0">
+        <label class="muted">map-migrated 标签值
+          <input id="ceTagVal" placeholder="如 migABCDE12345 (留空=不校验,任何非空值都算已打标)" style="width:340px"/>
+        </label>
+        <button onclick="saveCeTag()">💾 保存</button>
+        <span id="ceTagSave" style="font-size:13px"></span>
+      </div>
       <div class="chartbar" style="margin:12px 0">
         <button onclick="loadCe()">刷新费用</button>
         <span id="ceMeta" class="muted"></span>
@@ -1185,6 +1264,7 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
       <div class="muted" style="margin-top:12px;line-height:1.7">
         数据来自 <b>Cost Explorer 真实账单</b>(UnblendedCost,仅 Amazon Bedrock Service 账单行,非估算),按上方日期区间查询,一次覆盖<b>中心 + 全部注册账号</b>;账号/区域选择器不影响本面板。
         map-migrated 拆分需要各账号已激活该成本分配标签;跨账号需 reader 角色有 ce:GetCostAndUsage。每账号每次查询产生 $0.02 CE API 费用。
+        <b>标签值校验:</b>设置 map-migrated 标签值后,只有值完全一致才计入“已打标”;值不符(常见手滑多敲空格)的单独列为<b>无效打标</b>并列出具体错误值,方便去资源上改标。
       </div>
     </div>
   </div>
@@ -1443,26 +1523,56 @@ function toggleCe(){
   w.style.display=open?'block':'none';
   document.getElementById('ceToggle').textContent=open?'收起 ▴':'展开 ▾';
 }
+let ceTagLoaded=false;
+async function loadCeTag(){
+  if(ceTagLoaded)return;
+  try{
+    const d=await getJSON('?format=settings');
+    document.getElementById('ceTagVal').value=(d.settings&&d.settings.map_tag_value)||'';
+    ceTagLoaded=true;
+  }catch(e){}
+}
+async function saveCeTag(){
+  const m=document.getElementById('ceTagSave');m.textContent='保存中…';
+  const cfg={map_tag_value:document.getElementById('ceTagVal').value.trim()};
+  try{
+    const d=await getJSON(`?action=save_settings&key=&settings_json=${encodeURIComponent(JSON.stringify(cfg))}`);
+    if(d.error)throw new Error(d.error);
+    document.getElementById('ceTagVal').value=(d.settings&&d.settings.map_tag_value)||'';
+    m.textContent='✅ 已保存,重新查询中…';
+    await loadCe();m.textContent='✅ 已保存';
+  }catch(e){m.textContent='❌ '+e.message;}
+}
+const escTag=x=>String(x).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/ /g,'<span style="background:rgba(251,191,36,.35);border-radius:2px">·</span>');
 async function loadCe(){
   if(!checkRange())return;
+  loadCeTag();
   const m=document.getElementById('ceMeta');m.textContent='查询 Cost Explorer…';
   document.getElementById('ceCards').innerHTML='';document.getElementById('ceTable').innerHTML='';
   try{
     const d=await getJSON(`?format=cecost&${qs()}`);
     m.textContent=`账单窗口 ${d.start} → ${d.end}(含) · 全区域 · 全部账号`;
     const money=x=>'$'+Number(x).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+    const exp=d.expectedTag||'';
     document.getElementById('ceCards').innerHTML=`
       <div class="card hl"><div class="k">Bedrock 总费用</div><div class="v">${money(d.total)}</div></div>
-      <div class="card"><div class="k">map-migrated 已打标</div><div class="v">${money(d.tagged)}</div></div>
+      <div class="card"><div class="k">map-migrated 已打标${exp?'(值匹配)':''}</div><div class="v">${money(d.tagged)}</div></div>
+      ${exp?`<div class="card"><div class="k">⚠️ 无效打标(值不符)</div><div class="v" style="color:${(d.mistagged||0)>0?'#fbbf24':'inherit'}">${money(d.mistagged||0)}</div></div>`:''}
       <div class="card"><div class="k">未打标</div><div class="v">${money(d.untagged)}</div></div>
       <div class="card"><div class="k">打标占比</div><div class="v">${d.taggedPct}%</div></div>`;
     let html='';
     if(d.rows&&d.rows.length){
-      html+=`<table><thead><tr><th>账号</th><th>总费用</th><th>map-migrated 已打标</th><th>未打标</th><th>打标占比</th></tr></thead><tbody>${
+      const misTh=exp?'<th>无效打标</th>':'';
+      html+=`<table><thead><tr><th>账号</th><th>总费用</th><th>map-migrated 已打标</th>${misTh}<th>未打标</th><th>打标占比</th></tr></thead><tbody>${
         d.rows.map(r=>r.error
-          ?`<tr><td>${r.label}</td><td colspan="4"><span class="err">查询失败: ${r.error}</span></td></tr>`
-          :`<tr><td>${r.label}</td><td>${money(r.total)}</td><td>${money(r.tagged)}</td><td>${money(r.untagged)}</td><td>${r.taggedPct}%</td></tr>`).join('')}</tbody></table>`;
+          ?`<tr><td>${r.label}</td><td colspan="${exp?5:4}"><span class="err">查询失败: ${r.error}</span></td></tr>`
+          :`<tr><td>${r.label}</td><td>${money(r.total)}</td><td>${money(r.tagged)}</td>${exp?`<td>${money(r.mistagged||0)}</td>`:''}<td>${money(r.untagged)}</td><td>${r.taggedPct}%</td></tr>`).join('')}</tbody></table>`;
     }else{html='<div class="loading">该窗口无数据</div>';}
+    if(exp&&d.misValues&&d.misValues.length){
+      html+=`<div style="margin-top:10px;color:#fde68a">⚠️ 以下标签值与设定值 <code>${escTag(exp)}</code> 不符(标签打了但不生效,黄点 · = 空格):</div>`;
+      html+=`<table style="margin-top:6px"><thead><tr><th>实际标签值</th><th>原因</th><th>金额</th></tr></thead><tbody>${
+        d.misValues.map(v=>`<tr><td><code>${escTag(v.value)}</code></td><td>${v.reason||''}</td><td>${money(v.cost)}</td></tr>`).join('')}</tbody></table>`;
+    }
     if(d.note){html+=`<div class="muted" style="margin-top:8px">⚠️ ${d.note}</div>`;}
     document.getElementById('ceTable').innerHTML=html;
   }catch(e){m.textContent='';document.getElementById('ceTable').innerHTML=`<div class="err">查询失败: ${e.message}</div>`;}
