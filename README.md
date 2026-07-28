@@ -90,6 +90,18 @@ DASH_PASS='你的登录密码' ./deploy.sh
 
 **灰区统计(可选,需 `OPS_PANELS=true`)** — 统计失败请求中已计费的 token(输入被读入即计费、流式中途失败已产出的输出)。需按区域开启 Model Invocation Logging:`./enable-invocation-logging.sh <region>`(默认只记元数据;`--with-text` 才记正文;仅 bedrock-runtime,区域不能选 global)。
 
+**Claude Code Skill** — 仓库自带 [.claude/skills/bedrock-monitor](.claude/skills/bedrock-monitor/SKILL.md),在仓库目录里运行 Claude Code 即自动可用,直接问"Bedrock 花了多少钱 / 打标占比多少"即可。首次使用需配置连接信息(找部署者要地址和账密):
+
+```bash
+cat > ~/.bedrock-dash.env <<'EOF'
+BEDROCK_DASH_URL='https://xxxxxxxxxx.cloudfront.net'
+BEDROCK_DASH_AUTH='admin:密码'
+EOF
+chmod 600 ~/.bedrock-dash.env
+```
+
+想在任意目录使用,把 skill 拷到个人目录:`cp -r .claude/skills/bedrock-monitor ~/.claude/skills/`。
+
 ## 📈 API
 
 均需 Basic Auth。时间参数 `start`/`end`(YYYY-MM-DD, UTC)或 `days=7`;`region` 为具体区域或 `global`。
