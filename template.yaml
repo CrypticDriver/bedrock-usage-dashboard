@@ -85,6 +85,12 @@ Resources:
                   - bedrock:ListInferenceProfiles
                   - bedrock:GetInferenceProfile
                   - bedrock:GetModelInvocationLoggingConfiguration
+                  # mantle 端点(GPT-5.6 等)的 Projects 列表:把 CloudWatch 里的
+                  # project id 翻译成名字。ListProjects 会连带返回 tags,
+                  # 故还需 ListTagsForResource,否则整个请求 401。
+                  # 缺这两项只降级显示 id,不影响用量统计。
+                  - bedrock-mantle:ListProjects
+                  - bedrock-mantle:ListTagsForResource
                   - ec2:DescribeRegions
                   - pricing:GetProducts
                   - logs:StartQuery
