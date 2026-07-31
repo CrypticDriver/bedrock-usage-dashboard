@@ -17,6 +17,9 @@ from pathlib import Path
 
 import boto3
 from botocore.config import Config
+from botocore.auth import SigV4Auth
+from botocore.awsrequest import AWSRequest
+from botocore.httpsession import URLLib3Session
 
 # 快速失败:慢区/无用量区不拖累 global 扫描
 FAST = Config(connect_timeout=3, read_timeout=12, retries={"max_attempts": 2},
@@ -131,12 +134,26 @@ DEFAULT_SESS = boto3.Session()  # 中心账号默认会话
 METRICS = {"InputTokenCount": "in", "OutputTokenCount": "out",
            "CacheReadInputTokenCount": "cache_read", "CacheWriteInputTokenCount": "cache_write"}
 
+# GPT-5.6(Responses API / bedrock-mantle 端点)的指标自成一套命名空间:
+# 维度是 Model 而非 ModelId,且只有 Total* 系列是跨 Project 汇总值
+# (InputTokens/OutputTokens 必须带 Project 维度才有数据点)。
+# 无 cache_read/cache_write 指标,故显式缓存用量目前无法从 CloudWatch 统计。
+MANTLE_NAMESPACE = "AWS/BedrockMantle"
+MANTLE_METRICS = {"TotalInputTokens": "in", "TotalOutputTokens": "out"}
+# 带 Project 维度的分项指标(用于按 project 拆分);其和等于对应的 Total*
+MANTLE_PROJECT_METRICS = {"InputTokens": "in", "OutputTokens": "out"}
+
 DEFAULT_PRICES = {  # 内置兜底 USD / 1M tokens
     "opus":   {"in": 5,   "out": 25,  "cache_read": 0.5,  "cache_write": 7.0},
     "sonnet": {"in": 3,   "out": 15,  "cache_read": 0.3,  "cache_write": 3.75},
     "haiku":  {"in": 1,   "out": 5,   "cache_read": 0.1,  "cache_write": 1.25},
     "fable":  {"in": 10,  "out": 50,  "cache_read": 1.0,  "cache_write": 12.5},
     "nova":   {"in": 0.3, "out": 1.2, "cache_read": 0.03, "cache_write": 0.375},
+    # GPT-5.6(Responses API / mantle):2026-07-30 调价后价目,us-east-1/2 与 us-west-2 同价。
+    # cache_write = 1.25×in、cache_read = 0.1×in;mantle 无缓存指标,故这两项当前恒按 0 token 计费。
+    "gpt-5.6-sol":   {"in": 5.5,  "out": 33.0, "cache_read": 0.55,  "cache_write": 6.88},
+    "gpt-5.6-terra": {"in": 2.2,  "out": 13.2, "cache_read": 0.22,  "cache_write": 2.75},
+    "gpt-5.6-luna":  {"in": 0.22, "out": 1.32, "cache_read": 0.022, "cache_write": 0.275},
 }
 
 _prices = None       # (table, source)
@@ -352,12 +369,15 @@ def display_model(mid, regions, sess=None):
     return label
 
 
-def price_for(model_id, regions, sess=None):
-    """返回 (price_dict_or_None, source_label)。含应用配置反查。"""
+def price_for(model_id, regions, sess=None, source="runtime"):
+    """返回 (price_dict_or_None, source_label)。含应用配置反查。
+    mantle 模型(Responses API)不存在 inference profile,跳过反查省掉无谓 API 调用。"""
     table, psource = load_prices()
     price, key = resolve_price(model_id, table)
     if price:
         return price, f"{psource}:{key}"
+    if source == "mantle":
+        return None, "UNKNOWN"
     fm = underlying_model(regions, model_id, sess)
     if fm:
         price, key = resolve_price(fm, table)
@@ -449,7 +469,8 @@ def run_alert_check(cfg=None, force_send=False):
     end = dt.datetime.now(dt.UTC)
     start = end - dt.timedelta(hours=hours)
     data = build_data(cfg.get("region", "global"), start, end)
-    raw_bad = [r for r in data["rows"] if not is_taggable_profile(r["id"])]
+    # 用 build_data 已算好的 taggable(mantle/Responses API 模型天然不可打标),避免两处逻辑分叉
+    raw_bad = [r for r in data["rows"] if not r.get("taggable", is_taggable_profile(r["id"]))]
     ignore = cfg.get("ignore_list") or []
     bad = [r for r in raw_bad if not _is_ignored(r["id"], ignore)]
     ignored_count = len(raw_bad) - len(bad)
@@ -547,23 +568,100 @@ def regions_for(region):
     return [region]
 
 
+_mantle_projects = {}  # (region, account_key) -> {project_id: name}
+_MANTLE_HTTP = URLLib3Session(timeout=8)
+
+
+def mantle_projects(region, sess=None):
+    """查 bedrock-mantle Projects,返回 {project_id: name}(如 proj_xxx -> gpt-test)。
+    CloudWatch 只记 project id,名字要靠这里补。控制面在 /v1(非 /openai/v1,后者仅推理)。
+    该 API 无 boto3 client,需自行 SigV4 签名(service 名必须是 bedrock-mantle,
+    用 bedrock 会被判 credential 未正确 scope 而 401);失败降级为空表,前端退回显示 id。"""
+    sess = sess or DEFAULT_SESS
+    creds = sess.get_credentials()
+    key = (region, getattr(creds, "access_key", "")[-6:] if creds else "")
+    if key in _mantle_projects:
+        return _mantle_projects[key]
+    out = {}
+    try:
+        frozen = creds.get_frozen_credentials()
+        url = f"https://bedrock-mantle.{region}.api.aws/v1/organization/projects"
+        req = AWSRequest(method="GET", url=url,
+                         headers={"content-type": "application/json"})
+        SigV4Auth(frozen, "bedrock-mantle", region).add_auth(req)
+        resp = _MANTLE_HTTP.send(req.prepare())
+        body = resp.text if hasattr(resp, "text") else resp.content.decode()
+        if resp.status_code == 200:
+            for p in json.loads(body).get("data", []):
+                if p.get("id"):
+                    out[p["id"]] = p.get("name") or p["id"]
+        else:
+            # 常见原因: 角色缺 bedrock-mantle:ListProjects / ListTagsForResource
+            # (跨账号需重跑 onboarding 更新 reader 角色权限)
+            print(f"[mantle_projects] {region} HTTP {resp.status_code}: {body[:300]}")
+    except Exception as e:
+        print(f"[mantle_projects] {region} skipped: {e!r}")
+    _mantle_projects[key] = out
+    return out
+
+
 def discover_models(cw):
-    models = set()
+    """发现该区域有 token 指标的模型。
+    返回 ({model_id: "runtime"|"mantle"}, {model_id: [project_id, ...]})。
+    runtime = AWS/Bedrock(ModelId 维度);mantle = AWS/BedrockMantle(Model 维度, 如 GPT-5.6)。
+    mantle 模型额外收集其 Project 分项,用于按 project 拆分用量。"""
+    found = {}
+    projects = {}
     for page in cw.get_paginator("list_metrics").paginate(
             Namespace="AWS/Bedrock", MetricName="InputTokenCount"):
         for m in page["Metrics"]:
             dims = {d["Name"]: d["Value"] for d in m["Dimensions"]}
             if set(dims) == {"ModelId"}:
-                models.add(dims["ModelId"])
-    return sorted(models)
+                found[dims["ModelId"]] = "runtime"
+    try:
+        for page in cw.get_paginator("list_metrics").paginate(
+                Namespace=MANTLE_NAMESPACE, MetricName="TotalInputTokens"):
+            for m in page["Metrics"]:
+                dims = {d["Name"]: d["Value"] for d in m["Dimensions"]}
+                if set(dims) == {"Model"}:  # 仅 Model 维度 = 跨 Project 汇总
+                    found.setdefault(dims["Model"], "mantle")
+        # Project 分项只挂在 InputTokens/OutputTokens 上(Total* 无 Project 维度)
+        for page in cw.get_paginator("list_metrics").paginate(
+                Namespace=MANTLE_NAMESPACE, MetricName="InputTokens"):
+            for m in page["Metrics"]:
+                dims = {d["Name"]: d["Value"] for d in m["Dimensions"]}
+                if set(dims) == {"Model", "Project"}:
+                    projects.setdefault(dims["Model"], set()).add(dims["Project"])
+    except Exception as e:
+        print(f"[discover_models] mantle namespace skipped: {e!r}")
+    return found, {k: sorted(v) for k, v in projects.items()}
+
+
+def _metric_query(model_id, metric_name, period, source, project=None):
+    """按端点生成单条 GetMetricData 查询(两端命名空间与维度名不同)。
+    project 非空时加上 Project 维度(仅 mantle 支持)。"""
+    ns, dim = (("AWS/Bedrock", "ModelId") if source == "runtime"
+               else (MANTLE_NAMESPACE, "Model"))
+    dims = [{"Name": dim, "Value": model_id}]
+    if project:
+        dims.append({"Name": "Project", "Value": project})
+    return {"Metric": {"Namespace": ns, "MetricName": metric_name,
+                       "Dimensions": dims},
+            "Period": period, "Stat": "Sum"}
 
 
 def _queries(model_id, period):
-    ids = {f"m{i}": key for i, key in enumerate(METRICS.values())}
-    q = [{"Id": f"m{i}", "MetricStat": {
-        "Metric": {"Namespace": "AWS/Bedrock", "MetricName": name,
-                   "Dimensions": [{"Name": "ModelId", "Value": model_id}]},
-        "Period": period, "Stat": "Sum"}} for i, name in enumerate(METRICS)]
+    """单模型查询:两个端点都查。模型只会存在于其中一个端点,
+    另一个返回空值(GetMetricData 对不存在的指标不报错),故不会重复计数。"""
+    q, ids = [], {}
+    for i, (name, field) in enumerate(METRICS.items()):
+        ids[f"m{i}"] = field
+        q.append({"Id": f"m{i}",
+                  "MetricStat": _metric_query(model_id, name, period, "runtime")})
+    for i, (name, field) in enumerate(MANTLE_METRICS.items()):
+        ids[f"n{i}"] = field
+        q.append({"Id": f"n{i}",
+                  "MetricStat": _metric_query(model_id, name, period, "mantle")})
     return q, ids
 
 
@@ -578,45 +676,79 @@ def get_tokens(cw, model_id, start, end):
 
 
 def get_series(cw, model_id, start, end):
-    """返回 {date(YYYY-MM-DD): {in,out,cache_read,cache_write}} 按天。"""
+    """返回 ({date(YYYY-MM-DD): {in,out,cache_read,cache_write}}, source)。
+    source 由实际产出数据的端点决定(m* = runtime, n* = mantle)。"""
     q, ids = _queries(model_id, 86400)
     days = {}
+    source = None
     for page in cw.get_paginator("get_metric_data").paginate(
             MetricDataQueries=q, StartTime=start, EndTime=end):
         for r in page["MetricDataResults"]:
             key = ids[r["Id"]]
+            if r["Values"] and source is None:
+                source = "mantle" if r["Id"].startswith("n") else "runtime"
             for ts, v in zip(r["Timestamps"], r["Values"]):
                 d = ts.strftime("%Y-%m-%d")
                 days.setdefault(d, dict.fromkeys(METRICS.values(), 0.0))[key] += v
-    return days
+    return days, source
 
 
 def region_tokens(region, start, end, sess=None):
-    """单区域:发现所有模型 + 一次批量 get_metric_data 取齐所有指标。返回 {mid: tokens}。"""
+    """单区域:发现所有模型 + 一次批量 get_metric_data 取齐所有指标。
+    返回 ({mid: tokens}, {mid: "runtime"|"mantle"}, {mid: {project_id: tokens}})。
+    mantle 模型额外按 Project 拆分(各分项之和 == Total*,已用对账兜底防漏)。"""
     sess = sess or DEFAULT_SESS
     cw = sess.client("cloudwatch", region_name=region, config=FAST)
-    mids = discover_models(cw)
-    if not mids:
-        return {}
-    keys = list(METRICS.items())  # [(metricName, field), ...]
+    found, model_projects = discover_models(cw)
+    if not found:
+        return {}, {}, {}
     qlist, idmap = [], {}
-    for mi, mid in enumerate(mids):
+    for mi, (mid, source) in enumerate(sorted(found.items())):
+        keys = list(METRICS.items()) if source == "runtime" else list(MANTLE_METRICS.items())
         for ki, (name, field) in enumerate(keys):
             qid = f"q{mi}_{ki}"
-            idmap[qid] = (mid, field)
-            qlist.append({"Id": qid, "MetricStat": {
-                "Metric": {"Namespace": "AWS/Bedrock", "MetricName": name,
-                           "Dimensions": [{"Name": "ModelId", "Value": mid}]},
-                "Period": 86400, "Stat": "Sum"}})  # 按 UTC 天分桶(对齐账单 + 数据量小)
-    agg = {mid: dict.fromkeys(METRICS.values(), 0.0) for mid in mids}
+            idmap[qid] = (mid, field, None)
+            # 按 UTC 天分桶(对齐账单 + 数据量小)
+            qlist.append({"Id": qid,
+                          "MetricStat": _metric_query(mid, name, 86400, source)})
+        if source != "mantle":
+            continue
+        for pi, proj in enumerate(model_projects.get(mid, [])):
+            for ki, (name, field) in enumerate(MANTLE_PROJECT_METRICS.items()):
+                qid = f"p{mi}_{pi}_{ki}"
+                idmap[qid] = (mid, field, proj)
+                qlist.append({"Id": qid, "MetricStat": _metric_query(
+                    mid, name, 86400, source, project=proj)})
+    agg = {mid: dict.fromkeys(METRICS.values(), 0.0) for mid in found}
+    per_project = {}
     for i in range(0, len(qlist), 500):  # GetMetricData 每次最多 500 个查询
         chunk = qlist[i:i + 500]
         for page in cw.get_paginator("get_metric_data").paginate(
                 MetricDataQueries=chunk, StartTime=start, EndTime=end):
             for r in page["MetricDataResults"]:
-                mid, field = idmap[r["Id"]]
-                agg[mid][field] += sum(r["Values"])
-    return {mid: t for mid, t in agg.items() if sum(t.values())}
+                mid, field, proj = idmap[r["Id"]]
+                if proj is None:
+                    agg[mid][field] += sum(r["Values"])
+                else:
+                    p = per_project.setdefault(mid, {}).setdefault(
+                        proj, dict.fromkeys(METRICS.values(), 0.0))
+                    p[field] += sum(r["Values"])
+    tokens = {mid: t for mid, t in agg.items() if sum(t.values())}
+    # 对账:分项之和应等于 Total*。若少了(如新 project 的指标还没被 list_metrics 发现),
+    # 差额归入"(未归集)",保证按 project 视图的总和不小于总量、不静默丢用量。
+    projects = {}
+    for mid in tokens:
+        if mid not in per_project:
+            continue
+        rows = {p: t for p, t in per_project[mid].items() if sum(t.values())}
+        gap = {k: tokens[mid][k] - sum(t[k] for t in rows.values())
+               for k in METRICS.values()}
+        if any(v > 0.5 for v in gap.values()):
+            rows["(未归集)"] = {k: max(0.0, v) for k, v in gap.items()}
+            print(f"[region_tokens] {region} {mid}: project 分项少于总量,差额计入(未归集) {gap}")
+        if rows:
+            projects[mid] = rows
+    return tokens, {mid: found[mid] for mid in tokens}, projects
 
 
 def build_data(region, start, end, sess=None):
@@ -624,35 +756,62 @@ def build_data(region, start, end, sess=None):
     regions = regions_for(region)
     failed = []
     agg = {}
+    sources = {}
+    proj_agg = {}
+    mantle_regions = set()
     with ThreadPoolExecutor(max_workers=min(18, len(regions))) as ex:
         futs = {ex.submit(region_tokens, r, start, end, sess): r for r in regions}
         for f in as_completed(futs):
             try:
-                res = f.result()
+                res, src, projs = f.result()
             except Exception as e:
                 # 单区失败原本静默跳过,导致数据缺块无迹可查
                 failed.append(futs[f])
                 print(f"[build_data] region {futs[f]} FAILED: {e!r}")
                 continue
+            sources.update(src)
             for mid, t in res.items():
                 a = agg.setdefault(mid, dict.fromkeys(METRICS.values(), 0.0))
                 for k in METRICS.values():
                     a[k] += t[k]
+            for mid, rows in projs.items():
+                mantle_regions.add(futs[f])
+                dst = proj_agg.setdefault(mid, {})
+                for proj, t in rows.items():
+                    p = dst.setdefault(proj, dict.fromkeys(METRICS.values(), 0.0))
+                    for k in METRICS.values():
+                        p[k] += t[k]
+    # project id -> 名字(如 proj_xxx -> gpt-test);只在确有 mantle 用量时才查
+    pnames = {}
+    for r in sorted(mantle_regions):
+        pnames.update(mantle_projects(r, sess))
     rows, total = [], 0.0
     for mid, t in agg.items():
-        price, src = price_for(mid, regions, sess)
+        endpoint = sources.get(mid, "runtime")
+        mantle = endpoint == "mantle"
+        price, src = price_for(mid, regions, sess, endpoint)
         cost = sum(t[k] / 1e6 * price[k] for k in METRICS.values()) if price else 0.0
         total += cost
-        taggable = is_taggable_profile(mid)
+        taggable = False if mantle else is_taggable_profile(mid)
         arn = ""
         kind = "模型 ID"
-        if taggable:
+        if mantle:
+            kind = "Responses API (mantle)"  # 如 GPT-5.6,无 cache 指标/不可打标
+        elif taggable:
             arn = profile_info(regions, mid, sess)[2] or (mid if mid.startswith("arn:") else "")
             kind = "应用推理 profile"
         elif mid.startswith(PROFILE_ID_PREFIXES):
             kind = "系统跨区 profile"
+        projects = []
+        for proj, pt in sorted(proj_agg.get(mid, {}).items(),
+                               key=lambda x: -(x[1]["in"] + x[1]["out"])):
+            pcost = sum(pt[k] / 1e6 * price[k] for k in METRICS.values()) if price else 0.0
+            projects.append({"project": proj, "name": pnames.get(proj, proj),
+                             "in": int(pt["in"]), "out": int(pt["out"]),
+                             "cost": round(pcost, 2)})
         rows.append({"id": mid, "model": display_model(mid, regions, sess),
                      "kind": kind, "arn": arn, "taggable": taggable,
+                     "endpoint": endpoint, "projects": projects,
                      "in": int(t["in"]), "out": int(t["out"]),
                      "cache_read": int(t["cache_read"]), "cache_write": int(t["cache_write"]),
                      "cost": round(cost, 2), "price": src})
@@ -673,15 +832,18 @@ def build_series(region, model_id, start, end, sess=None):
         try:
             return get_series(sess.client("cloudwatch", region_name=r, config=FAST), model_id, start, end)
         except Exception:
-            return {}
+            return {}, None
     merged = {}
+    source = "runtime"
     with ThreadPoolExecutor(max_workers=min(18, len(regions))) as ex:
-        for s in ex.map(one, regions):
+        for s, src in ex.map(one, regions):
+            if src:
+                source = src
             for d, t in s.items():
                 m = merged.setdefault(d, dict.fromkeys(METRICS.values(), 0.0))
                 for k in METRICS.values():
                     m[k] += t[k]
-    price, src = price_for(model_id, regions, sess)
+    price, src = price_for(model_id, regions, sess, source)
     points = []
     for d in sorted(merged):
         t = merged[d]
@@ -690,7 +852,8 @@ def build_series(region, model_id, start, end, sess=None):
                        "in": int(t["in"]), "out": int(t["out"]),
                        "cache_read": int(t["cache_read"]), "cache_write": int(t["cache_write"])})
     return {"region": region, "model": display_model(model_id, regions, sess), "id": model_id,
-            "price": src, "points": points, "total": round(sum(p["cost"] for p in points), 2),
+            "price": src, "endpoint": source, "points": points,
+            "total": round(sum(p["cost"] for p in points), 2),
             "estimate": True}
 
 
@@ -1161,6 +1324,9 @@ th{background:rgba(255,255,255,.06);color:#aab2d6;font-weight:600;font-size:12px
 td:first-child,th:first-child{text-align:left}
 tr{border-top:1px solid rgba(255,255,255,.07)}
 tbody tr:hover{background:rgba(255,255,255,.04)}
+tbody tr.subrow{background:rgba(255,255,255,.02);font-size:12px}
+tbody tr.subrow td{color:#9aa3c7;padding-top:5px;padding-bottom:5px}
+tbody tr.subrow td:first-child{padding-left:26px}
 .cost{color:#34d399;font-weight:600}
 .pill{font-size:11px;color:#9aa3c7;background:rgba(255,255,255,.06);padding:2px 8px;border-radius:999px;white-space:nowrap;display:inline-block}
 .pill.ok{color:#34d399;background:rgba(52,211,153,.1);border:1px solid rgba(52,211,153,.3)}
@@ -1286,7 +1452,7 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
   <!--OPS_PANELS_START-->
   <div class="panel">
     <div class="phead" onclick="toggleErr()">
-      <h3>🚨 错误监控 <span class="muted">· 基于 CloudWatch 指标 · 含 mantle 与历史</span></h3>
+      <h3>🚨 错误监控 <span class="muted">· 基于 CloudWatch 指标 · 仅 bedrock-runtime</span></h3>
       <span class="chev" id="errToggle">展开 ▾</span>
     </div>
     <div id="errWrap" style="display:none">
@@ -1297,9 +1463,11 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
       <div class="cards" id="errCards"></div>
       <div id="errTable"></div>
       <div class="muted" style="margin-top:12px;line-height:1.7">
-        用当前「账号/区域/日期」。指标覆盖 <b>runtime 与 mantle 两种端点</b>,
+        用当前「账号/区域/日期」。指标取自 <b>AWS/Bedrock</b>(bedrock-runtime 端点),
         且不受"调用日志是否开启"影响——这里能看到灰区面板(仅 runtime 日志)看不到的 server error 等。
         与灰区面板互补:此处看「有多少错」,灰区看「错的有没有计费 token」。
+        ⚠️ 暂不含 mantle/Responses API(如 GPT-5.6):其错误指标在 AWS/BedrockMantle
+        命名空间(仅 InferenceClientErrors,无 server error/throttle)。
       </div>
     </div>
   </div>
@@ -1324,7 +1492,7 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
       <div class="muted" style="margin-top:12px;line-height:1.7">
         灰区 = 失败请求里已计费的 token:<b>输入</b>只要被模型处理就计费;<b>输出</b>为流式中途失败已产出的部分。
         用所选「账号/区域/日期」+ 上面日志组,基于 <b>Model Invocation Logging</b> 精确统计。
-        ⚠️ 仅 bedrock-runtime(mantle/Responses API 不被记录);需该区域已开启 invocation logging。
+        ⚠️ 仅 bedrock-runtime(mantle/Responses API 如 GPT-5.6 不被记录);需该区域已开启 invocation logging。
       </div>
     </div>
   </div>
@@ -1424,6 +1592,7 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
 </div>
 <script>
 const fmt=n=>n.toLocaleString('en-US');
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const iso=d=>d.toISOString().slice(0,10);
 async function getJSON(url){
   const r=await fetch(url);
@@ -1492,11 +1661,24 @@ function renderMain(){
     <thead><tr><th>模型</th><th>类型</th><th>输入</th><th>输出</th><th>缓存读</th><th>缓存写</th><th>估算成本</th></tr></thead>
     <tbody>${d.rows.map(x=>`<tr data-tip="${x.arn||x.id}">
       <td>${x.model}</td>
-      <td style="text-align:left"><span class="pill ${x.taggable?'ok':'warn'}" title="${x.taggable?(x.arn||x.id):'不可按标签分账'}">${x.kind||''}</span></td>
+      <td style="text-align:left"><span class="pill ${x.taggable?'ok':'warn'}" title="${x.taggable?(x.arn||x.id):(x.endpoint==='mantle'?'Responses API(mantle)端点:不支持成本分配标签,且无缓存 token 指标':'不可按标签分账')}">${x.kind||''}</span></td>
       <td>${tok(x.in)}</td><td>${tok(x.out)}</td>
-      <td>${tok(x.cache_read)}</td><td>${tok(x.cache_write)}</td>
-      <td class="cost">≈ $${fmt(x.cost)}</td></tr>`).join('')
+      <td>${x.endpoint==='mantle'?'<span class="muted" title="mantle 端点无缓存 token 指标">—</span>':tok(x.cache_read)}</td>
+      <td>${x.endpoint==='mantle'?'<span class="muted" title="mantle 端点无缓存 token 指标">—</span>':tok(x.cache_write)}</td>
+      <td class="cost">≈ $${fmt(x.cost)}</td></tr>${projRows(x)}`).join('')
       ||'<tr><td colspan=7 style="text-align:center;color:#8b94b8">该窗口无用量</td></tr>'}</tbody></table>`;
+}
+// mantle 模型按 Bedrock Project 拆分(project = mantle 端点的分账单位,对应 runtime 的应用推理 profile)
+function projRows(x){
+  const ps=x.projects||[];
+  // 只有单个 default 时无拆分意义,不展开
+  if(ps.length<2&&(!ps.length||ps[0].project==='default'))return '';
+  return ps.map(p=>`<tr class="subrow" data-tip="${esc(p.project)}">
+    <td>↳ <span class="pill" title="Bedrock Project: ${esc(p.project)}">📁 ${esc(p.name)}</span></td>
+    <td style="text-align:left" class="muted">${p.project==='(未归集)'?'分项与总量差额':'project'}</td>
+    <td>${tok(p.in)}</td><td>${tok(p.out)}</td>
+    <td>—</td><td>—</td>
+    <td class="cost">≈ $${fmt(p.cost)}</td></tr>`).join('');
 }
 function pick(id){document.getElementById('seriesModel').value=id;drawSeries();
   document.getElementById('chart').scrollIntoView({behavior:'smooth',block:'center'});}
@@ -1757,7 +1939,7 @@ function genOnboard(){
   document.getElementById('aExt').value=ext;
   const central=window._central||'';
   const trust='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"'+central+'"},"Action":"sts:AssumeRole","Condition":{"StringEquals":{"sts:ExternalId":"'+ext+'"}}}]}';
-  const perm='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["cloudwatch:GetMetricData","cloudwatch:ListMetrics","bedrock:ListInferenceProfiles","bedrock:GetInferenceProfile","ce:GetCostAndUsage"],"Resource":"*"}]}';
+  const perm='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["cloudwatch:GetMetricData","cloudwatch:ListMetrics","bedrock:ListInferenceProfiles","bedrock:GetInferenceProfile","bedrock-mantle:ListProjects","bedrock-mantle:ListTagsForResource","ce:GetCostAndUsage"],"Resource":"*"}]}';
   const rn='BedrockUsageReader-'+Math.random().toString(36).slice(2,6);
   const cmd='aws iam create-role --role-name '+rn+' \\\n'
     +"  --assume-role-policy-document '"+trust+"' \\\n"
