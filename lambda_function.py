@@ -131,6 +131,13 @@ DEFAULT_SESS = boto3.Session()  # 中心账号默认会话
 METRICS = {"InputTokenCount": "in", "OutputTokenCount": "out",
            "CacheReadInputTokenCount": "cache_read", "CacheWriteInputTokenCount": "cache_write"}
 
+# GPT-5.6(Responses API / bedrock-mantle 端点)的指标自成一套命名空间:
+# 维度是 Model 而非 ModelId,且只有 Total* 系列是跨 Project 汇总值
+# (InputTokens/OutputTokens 必须带 Project 维度才有数据点)。
+# 无 cache_read/cache_write 指标,故显式缓存用量目前无法从 CloudWatch 统计。
+MANTLE_NAMESPACE = "AWS/BedrockMantle"
+MANTLE_METRICS = {"TotalInputTokens": "in", "TotalOutputTokens": "out"}
+
 DEFAULT_PRICES = {  # 内置兜底 USD / 1M tokens
     "opus":   {"in": 5,   "out": 25,  "cache_read": 0.5,  "cache_write": 7.0},
     "sonnet": {"in": 3,   "out": 15,  "cache_read": 0.3,  "cache_write": 3.75},
@@ -352,12 +359,15 @@ def display_model(mid, regions, sess=None):
     return label
 
 
-def price_for(model_id, regions, sess=None):
-    """返回 (price_dict_or_None, source_label)。含应用配置反查。"""
+def price_for(model_id, regions, sess=None, source="runtime"):
+    """返回 (price_dict_or_None, source_label)。含应用配置反查。
+    mantle 模型(Responses API)不存在 inference profile,跳过反查省掉无谓 API 调用。"""
     table, psource = load_prices()
     price, key = resolve_price(model_id, table)
     if price:
         return price, f"{psource}:{key}"
+    if source == "mantle":
+        return None, "UNKNOWN"
     fm = underlying_model(regions, model_id, sess)
     if fm:
         price, key = resolve_price(fm, table)
@@ -449,7 +459,8 @@ def run_alert_check(cfg=None, force_send=False):
     end = dt.datetime.now(dt.UTC)
     start = end - dt.timedelta(hours=hours)
     data = build_data(cfg.get("region", "global"), start, end)
-    raw_bad = [r for r in data["rows"] if not is_taggable_profile(r["id"])]
+    # 用 build_data 已算好的 taggable(mantle/Responses API 模型天然不可打标),避免两处逻辑分叉
+    raw_bad = [r for r in data["rows"] if not r.get("taggable", is_taggable_profile(r["id"]))]
     ignore = cfg.get("ignore_list") or []
     bad = [r for r in raw_bad if not _is_ignored(r["id"], ignore)]
     ignored_count = len(raw_bad) - len(bad)
@@ -548,22 +559,48 @@ def regions_for(region):
 
 
 def discover_models(cw):
-    models = set()
+    """发现该区域有 token 指标的模型。返回 {model_id: "runtime"|"mantle"}。
+    runtime = AWS/Bedrock(ModelId 维度);mantle = AWS/BedrockMantle(Model 维度, 如 GPT-5.6)。"""
+    found = {}
     for page in cw.get_paginator("list_metrics").paginate(
             Namespace="AWS/Bedrock", MetricName="InputTokenCount"):
         for m in page["Metrics"]:
             dims = {d["Name"]: d["Value"] for d in m["Dimensions"]}
             if set(dims) == {"ModelId"}:
-                models.add(dims["ModelId"])
-    return sorted(models)
+                found[dims["ModelId"]] = "runtime"
+    try:
+        for page in cw.get_paginator("list_metrics").paginate(
+                Namespace=MANTLE_NAMESPACE, MetricName="TotalInputTokens"):
+            for m in page["Metrics"]:
+                dims = {d["Name"]: d["Value"] for d in m["Dimensions"]}
+                if set(dims) == {"Model"}:  # 仅 Model 维度 = 跨 Project 汇总
+                    found.setdefault(dims["Model"], "mantle")
+    except Exception as e:
+        print(f"[discover_models] mantle namespace skipped: {e!r}")
+    return found
+
+
+def _metric_query(model_id, metric_name, period, source):
+    """按端点生成单条 GetMetricData 查询(两端命名空间与维度名不同)。"""
+    ns, dim = (("AWS/Bedrock", "ModelId") if source == "runtime"
+               else (MANTLE_NAMESPACE, "Model"))
+    return {"Metric": {"Namespace": ns, "MetricName": metric_name,
+                       "Dimensions": [{"Name": dim, "Value": model_id}]},
+            "Period": period, "Stat": "Sum"}
 
 
 def _queries(model_id, period):
-    ids = {f"m{i}": key for i, key in enumerate(METRICS.values())}
-    q = [{"Id": f"m{i}", "MetricStat": {
-        "Metric": {"Namespace": "AWS/Bedrock", "MetricName": name,
-                   "Dimensions": [{"Name": "ModelId", "Value": model_id}]},
-        "Period": period, "Stat": "Sum"}} for i, name in enumerate(METRICS)]
+    """单模型查询:两个端点都查。模型只会存在于其中一个端点,
+    另一个返回空值(GetMetricData 对不存在的指标不报错),故不会重复计数。"""
+    q, ids = [], {}
+    for i, (name, field) in enumerate(METRICS.items()):
+        ids[f"m{i}"] = field
+        q.append({"Id": f"m{i}",
+                  "MetricStat": _metric_query(model_id, name, period, "runtime")})
+    for i, (name, field) in enumerate(MANTLE_METRICS.items()):
+        ids[f"n{i}"] = field
+        q.append({"Id": f"n{i}",
+                  "MetricStat": _metric_query(model_id, name, period, "mantle")})
     return q, ids
 
 
@@ -578,37 +615,41 @@ def get_tokens(cw, model_id, start, end):
 
 
 def get_series(cw, model_id, start, end):
-    """返回 {date(YYYY-MM-DD): {in,out,cache_read,cache_write}} 按天。"""
+    """返回 ({date(YYYY-MM-DD): {in,out,cache_read,cache_write}}, source)。
+    source 由实际产出数据的端点决定(m* = runtime, n* = mantle)。"""
     q, ids = _queries(model_id, 86400)
     days = {}
+    source = None
     for page in cw.get_paginator("get_metric_data").paginate(
             MetricDataQueries=q, StartTime=start, EndTime=end):
         for r in page["MetricDataResults"]:
             key = ids[r["Id"]]
+            if r["Values"] and source is None:
+                source = "mantle" if r["Id"].startswith("n") else "runtime"
             for ts, v in zip(r["Timestamps"], r["Values"]):
                 d = ts.strftime("%Y-%m-%d")
                 days.setdefault(d, dict.fromkeys(METRICS.values(), 0.0))[key] += v
-    return days
+    return days, source
 
 
 def region_tokens(region, start, end, sess=None):
-    """单区域:发现所有模型 + 一次批量 get_metric_data 取齐所有指标。返回 {mid: tokens}。"""
+    """单区域:发现所有模型 + 一次批量 get_metric_data 取齐所有指标。
+    返回 ({mid: tokens}, {mid: "runtime"|"mantle"})。"""
     sess = sess or DEFAULT_SESS
     cw = sess.client("cloudwatch", region_name=region, config=FAST)
-    mids = discover_models(cw)
-    if not mids:
-        return {}
-    keys = list(METRICS.items())  # [(metricName, field), ...]
+    found = discover_models(cw)
+    if not found:
+        return {}, {}
     qlist, idmap = [], {}
-    for mi, mid in enumerate(mids):
+    for mi, (mid, source) in enumerate(sorted(found.items())):
+        keys = list(METRICS.items()) if source == "runtime" else list(MANTLE_METRICS.items())
         for ki, (name, field) in enumerate(keys):
             qid = f"q{mi}_{ki}"
             idmap[qid] = (mid, field)
-            qlist.append({"Id": qid, "MetricStat": {
-                "Metric": {"Namespace": "AWS/Bedrock", "MetricName": name,
-                           "Dimensions": [{"Name": "ModelId", "Value": mid}]},
-                "Period": 86400, "Stat": "Sum"}})  # 按 UTC 天分桶(对齐账单 + 数据量小)
-    agg = {mid: dict.fromkeys(METRICS.values(), 0.0) for mid in mids}
+            # 按 UTC 天分桶(对齐账单 + 数据量小)
+            qlist.append({"Id": qid,
+                          "MetricStat": _metric_query(mid, name, 86400, source)})
+    agg = {mid: dict.fromkeys(METRICS.values(), 0.0) for mid in found}
     for i in range(0, len(qlist), 500):  # GetMetricData 每次最多 500 个查询
         chunk = qlist[i:i + 500]
         for page in cw.get_paginator("get_metric_data").paginate(
@@ -616,7 +657,8 @@ def region_tokens(region, start, end, sess=None):
             for r in page["MetricDataResults"]:
                 mid, field = idmap[r["Id"]]
                 agg[mid][field] += sum(r["Values"])
-    return {mid: t for mid, t in agg.items() if sum(t.values())}
+    tokens = {mid: t for mid, t in agg.items() if sum(t.values())}
+    return tokens, {mid: found[mid] for mid in tokens}
 
 
 def build_data(region, start, end, sess=None):
@@ -624,35 +666,42 @@ def build_data(region, start, end, sess=None):
     regions = regions_for(region)
     failed = []
     agg = {}
+    sources = {}
     with ThreadPoolExecutor(max_workers=min(18, len(regions))) as ex:
         futs = {ex.submit(region_tokens, r, start, end, sess): r for r in regions}
         for f in as_completed(futs):
             try:
-                res = f.result()
+                res, src = f.result()
             except Exception as e:
                 # 单区失败原本静默跳过,导致数据缺块无迹可查
                 failed.append(futs[f])
                 print(f"[build_data] region {futs[f]} FAILED: {e!r}")
                 continue
+            sources.update(src)
             for mid, t in res.items():
                 a = agg.setdefault(mid, dict.fromkeys(METRICS.values(), 0.0))
                 for k in METRICS.values():
                     a[k] += t[k]
     rows, total = [], 0.0
     for mid, t in agg.items():
-        price, src = price_for(mid, regions, sess)
+        endpoint = sources.get(mid, "runtime")
+        mantle = endpoint == "mantle"
+        price, src = price_for(mid, regions, sess, endpoint)
         cost = sum(t[k] / 1e6 * price[k] for k in METRICS.values()) if price else 0.0
         total += cost
-        taggable = is_taggable_profile(mid)
+        taggable = False if mantle else is_taggable_profile(mid)
         arn = ""
         kind = "模型 ID"
-        if taggable:
+        if mantle:
+            kind = "Responses API (mantle)"  # 如 GPT-5.6,无 cache 指标/不可打标
+        elif taggable:
             arn = profile_info(regions, mid, sess)[2] or (mid if mid.startswith("arn:") else "")
             kind = "应用推理 profile"
         elif mid.startswith(PROFILE_ID_PREFIXES):
             kind = "系统跨区 profile"
         rows.append({"id": mid, "model": display_model(mid, regions, sess),
                      "kind": kind, "arn": arn, "taggable": taggable,
+                     "endpoint": endpoint,
                      "in": int(t["in"]), "out": int(t["out"]),
                      "cache_read": int(t["cache_read"]), "cache_write": int(t["cache_write"]),
                      "cost": round(cost, 2), "price": src})
@@ -673,15 +722,18 @@ def build_series(region, model_id, start, end, sess=None):
         try:
             return get_series(sess.client("cloudwatch", region_name=r, config=FAST), model_id, start, end)
         except Exception:
-            return {}
+            return {}, None
     merged = {}
+    source = "runtime"
     with ThreadPoolExecutor(max_workers=min(18, len(regions))) as ex:
-        for s in ex.map(one, regions):
+        for s, src in ex.map(one, regions):
+            if src:
+                source = src
             for d, t in s.items():
                 m = merged.setdefault(d, dict.fromkeys(METRICS.values(), 0.0))
                 for k in METRICS.values():
                     m[k] += t[k]
-    price, src = price_for(model_id, regions, sess)
+    price, src = price_for(model_id, regions, sess, source)
     points = []
     for d in sorted(merged):
         t = merged[d]
@@ -690,7 +742,8 @@ def build_series(region, model_id, start, end, sess=None):
                        "in": int(t["in"]), "out": int(t["out"]),
                        "cache_read": int(t["cache_read"]), "cache_write": int(t["cache_write"])})
     return {"region": region, "model": display_model(model_id, regions, sess), "id": model_id,
-            "price": src, "points": points, "total": round(sum(p["cost"] for p in points), 2),
+            "price": src, "endpoint": source, "points": points,
+            "total": round(sum(p["cost"] for p in points), 2),
             "estimate": True}
 
 
@@ -1286,7 +1339,7 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
   <!--OPS_PANELS_START-->
   <div class="panel">
     <div class="phead" onclick="toggleErr()">
-      <h3>🚨 错误监控 <span class="muted">· 基于 CloudWatch 指标 · 含 mantle 与历史</span></h3>
+      <h3>🚨 错误监控 <span class="muted">· 基于 CloudWatch 指标 · 仅 bedrock-runtime</span></h3>
       <span class="chev" id="errToggle">展开 ▾</span>
     </div>
     <div id="errWrap" style="display:none">
@@ -1297,9 +1350,11 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
       <div class="cards" id="errCards"></div>
       <div id="errTable"></div>
       <div class="muted" style="margin-top:12px;line-height:1.7">
-        用当前「账号/区域/日期」。指标覆盖 <b>runtime 与 mantle 两种端点</b>,
+        用当前「账号/区域/日期」。指标取自 <b>AWS/Bedrock</b>(bedrock-runtime 端点),
         且不受"调用日志是否开启"影响——这里能看到灰区面板(仅 runtime 日志)看不到的 server error 等。
         与灰区面板互补:此处看「有多少错」,灰区看「错的有没有计费 token」。
+        ⚠️ 暂不含 mantle/Responses API(如 GPT-5.6):其错误指标在 AWS/BedrockMantle
+        命名空间(仅 InferenceClientErrors,无 server error/throttle)。
       </div>
     </div>
   </div>
@@ -1324,7 +1379,7 @@ tbody tr:hover{background:rgba(255,255,255,.04)}
       <div class="muted" style="margin-top:12px;line-height:1.7">
         灰区 = 失败请求里已计费的 token:<b>输入</b>只要被模型处理就计费;<b>输出</b>为流式中途失败已产出的部分。
         用所选「账号/区域/日期」+ 上面日志组,基于 <b>Model Invocation Logging</b> 精确统计。
-        ⚠️ 仅 bedrock-runtime(mantle/Responses API 不被记录);需该区域已开启 invocation logging。
+        ⚠️ 仅 bedrock-runtime(mantle/Responses API 如 GPT-5.6 不被记录);需该区域已开启 invocation logging。
       </div>
     </div>
   </div>
@@ -1492,9 +1547,10 @@ function renderMain(){
     <thead><tr><th>模型</th><th>类型</th><th>输入</th><th>输出</th><th>缓存读</th><th>缓存写</th><th>估算成本</th></tr></thead>
     <tbody>${d.rows.map(x=>`<tr data-tip="${x.arn||x.id}">
       <td>${x.model}</td>
-      <td style="text-align:left"><span class="pill ${x.taggable?'ok':'warn'}" title="${x.taggable?(x.arn||x.id):'不可按标签分账'}">${x.kind||''}</span></td>
+      <td style="text-align:left"><span class="pill ${x.taggable?'ok':'warn'}" title="${x.taggable?(x.arn||x.id):(x.endpoint==='mantle'?'Responses API(mantle)端点:不支持成本分配标签,且无缓存 token 指标':'不可按标签分账')}">${x.kind||''}</span></td>
       <td>${tok(x.in)}</td><td>${tok(x.out)}</td>
-      <td>${tok(x.cache_read)}</td><td>${tok(x.cache_write)}</td>
+      <td>${x.endpoint==='mantle'?'<span class="muted" title="mantle 端点无缓存 token 指标">—</span>':tok(x.cache_read)}</td>
+      <td>${x.endpoint==='mantle'?'<span class="muted" title="mantle 端点无缓存 token 指标">—</span>':tok(x.cache_write)}</td>
       <td class="cost">≈ $${fmt(x.cost)}</td></tr>`).join('')
       ||'<tr><td colspan=7 style="text-align:center;color:#8b94b8">该窗口无用量</td></tr>'}</tbody></table>`;
 }
