@@ -9,6 +9,7 @@
 | 能力 | 说明 |
 |------|------|
 | 📊 用量与成本 | 按模型展示输入 / 输出 / 缓存读写 token 与估算成本;按 UTC 天聚合,对齐账单口径 |
+| 🤖 GPT-5.6 纳管 | 覆盖走 Responses API(`bedrock-mantle` 端点)的 GPT-5.6 Sol/Terra/Luna,并按 **Bedrock Project** 拆分归集(该端点不支持成本分配标签) |
 | 💰 真实账单 | Cost Explorer 拉 Amazon Bedrock Service 账单行(UnblendedCost,非估算),跨账号一账号一行:总费用 / map-migrated 已打标 / 未打标 / 占比 |
 | 🏷️ 分账视角 | 类型列区分**模型 ID / 系统跨区 profile / 应用推理 profile**(绿 = 可按标签分账);悬停任意行即显完整 ARN / ModelId |
 | 🔔 分账告警 | 发现无法分账的用量(未走 app inference profile)→ 推送**钉钉 webhook**(可加签);EventBridge 定时检查,页面可视化配置;支持忽略清单 + 按窗口节流防重复轰炸 |
@@ -76,6 +77,8 @@ DASH_PASS='你的登录密码' ./deploy.sh
 
 **更新**:`git pull && ./deploy.sh` —— 密码沿用、栈增量更新,单价/账号/告警配置存于 Secrets **不会丢**。版本看页脚,变更见 [CHANGELOG.md](CHANGELOG.md),可 `git checkout v1.1.0` 锁版本。
 
+> ⬆️ **升到 1.7.0(GPT-5.6 纳管)有两处需手工介入**:成员账号补 `bedrock-mantle` 只读权限、单价表补 GPT-5.6 三条(单价存于 Secrets 会整表覆盖代码内置值,**新装同样需要**,否则成本列显示 UNKNOWN)。不做仅功能降级、不阻塞升级 —— 详见 [docs/UPGRADE-1.7.0.md](docs/UPGRADE-1.7.0.md)。
+
 **卸载**:`./destroy.sh`(自动清空缓存桶、删栈、清理 secrets 残留)。
 
 **改密码**:`DASH_PASS='新密码' ./deploy.sh`。
@@ -86,7 +89,7 @@ DASH_PASS='你的登录密码' ./deploy.sh
 
 **分账告警** — ⚙️ 配置 → 🔔 分账告警:填钉钉机器人 webhook(安全设置建议「加签」,或关键词含 `Bedrock`)、窗口(6/12/24h)、可选忽略清单(每行一个 id,支持前缀通配 `global.*`)、勾「启用」保存;🧪 可立即触发一次(异步,结果推钉钉,不受节流限制)。原理:只有 **application inference profile** 支持成本分配标签,窗口内出现模型 ID / 系统 profile 的用量即告警。扫描每 6h 一次(`ALERT_RATE` 可调),但**推送按所选窗口节流**——同一窗口只推一条,选 12/24h 不会重复告警同一笔用量。
 
-**单价** — ⚙️ 配置 → 单价配置,卡片式编辑(USD/1M tokens);匹配优先级:完整 ModelId > 家族关键字(opus/sonnet/haiku/fable/nova)。
+**单价** — ⚙️ 配置 → 单价配置,卡片式编辑(USD/1M tokens);匹配优先级:完整 ModelId > 家族关键字(opus/sonnet/haiku/fable/nova/gpt-5.6-sol/terra/luna)。
 
 **灰区统计(可选,需 `OPS_PANELS=true`)** — 统计失败请求中已计费的 token(输入被读入即计费、流式中途失败已产出的输出)。需按区域开启 Model Invocation Logging:`./enable-invocation-logging.sh <region>`(默认只记元数据;`--with-text` 才记正文;仅 bedrock-runtime,区域不能选 global)。
 

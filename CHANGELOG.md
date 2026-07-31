@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.7.0 (2026-07-31)
+
+**新增**
+- **GPT-5.6(Sol / Terra / Luna)用量纳入统计**:这类模型走 Responses API(`bedrock-mantle` 端点),指标在 `AWS/BedrockMantle` 命名空间、维度是 `Model` 而非 `ModelId`,此前**完全统计不到**(页面不报错,就是没有这几行,容易误判为"没人用")。现与 `AWS/Bedrock` 并发查询后合并,类型列显示 **Responses API (mantle)**
+- **按 Bedrock Project 拆分**:mantle 端点用 Project 做成本归集,模型行下展开 project 子行(名字 / id / token / 成本)。project id → 名字来自 `bedrock-mantle` 控制面,权限不足时降级显示 id;project 分项之和与模型总量对账,差额显式归入 **(未归集)**,不静默丢数
+- 内置 GPT-5.6 三档单价(2026-07-30 调价后:Terra ↓20%、Luna ↓80%、Sol 未变;三个可用区同价)
+- IAM 新增 `bedrock-mantle:ListProjects` + `bedrock-mantle:ListTagsForResource`(中心角色 template.yaml、`onboard-account.yaml`、页面 🎲 生成命令三处同步)。⚠️ 两条必须一起给:`ListProjects` 连带返回 tags,只给前者整个请求直接 401
+
+**变更**
+- mantle 行不再参与分账告警:该端点本就不支持成本分配标签,改用 `build_data` 输出的 `taggable` 判定,避免 GPT-5.6 因"不可分账"被每个窗口反复推送钉钉
+- mantle 行的缓存列显示 `—` 而非 `0`:该命名空间没有 cache token 指标,`0` 会被误读成"没命中缓存"
+- mantle 模型跳过 inference profile 反查(其不存在 profile),省掉无谓 API 调用
+
+**修复**
+- 真实账单(CE)金额恒为 0:服务名按 `Amazon Bedrock Service` 精确匹配,但 Marketplace 计费实际上报 `Amazon Bedrock` 或 `Claude Sonnet 5 (Amazon Bedrock Edition)` 等,导致所有账单行被过滤光。改为匹配含 `amazon bedrock` 的服务名;并在匹配为空时打印 CE 返回的服务名清单便于定位
+
+**⚠️ 升级需手工介入两处**(不做仅功能降级,不阻塞):成员账号补 IAM 权限、单价表补 GPT-5.6 三条(单价 secret 会整表覆盖代码内置值,**新装同样需要**)。详见 [docs/UPGRADE-1.7.0.md](docs/UPGRADE-1.7.0.md)
+
 ## 1.6.0 (2026-07-26)
 
 **新增**
