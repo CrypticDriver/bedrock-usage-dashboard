@@ -149,6 +149,11 @@ DEFAULT_PRICES = {  # 内置兜底 USD / 1M tokens
     "haiku":  {"in": 1,   "out": 5,   "cache_read": 0.1,  "cache_write": 1.25},
     "fable":  {"in": 10,  "out": 50,  "cache_read": 1.0,  "cache_write": 12.5},
     "nova":   {"in": 0.3, "out": 1.2, "cache_read": 0.03, "cache_write": 0.375},
+    # GPT-5.6(Responses API / mantle):2026-07-30 调价后价目,us-east-1/2 与 us-west-2 同价。
+    # cache_write = 1.25×in、cache_read = 0.1×in;mantle 无缓存指标,故这两项当前恒按 0 token 计费。
+    "gpt-5.6-sol":   {"in": 5.5,  "out": 33.0, "cache_read": 0.55,  "cache_write": 6.88},
+    "gpt-5.6-terra": {"in": 2.2,  "out": 13.2, "cache_read": 0.22,  "cache_write": 2.75},
+    "gpt-5.6-luna":  {"in": 0.22, "out": 1.32, "cache_read": 0.022, "cache_write": 0.275},
 }
 
 _prices = None       # (table, source)
