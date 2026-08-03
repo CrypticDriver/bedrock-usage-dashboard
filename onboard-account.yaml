@@ -49,6 +49,27 @@ Resources:
                   - bedrock-mantle:ListProjects
                   - bedrock-mantle:ListTagsForResource
                   - ce:GetCostAndUsage
+                  # 「IAM Principal 打标」面板(v1.8.0):列出有 Bedrock 调用权限的
+                  # Role/User 并读其 map-migrated 标签。纯只读,不含任何 iam:Tag*/Put*。
+                  # 缺这组权限只是该账号在此面板显示"权限不足",不影响用量与账单统计。
+                  - iam:ListRoles
+                  - iam:ListUsers
+                  - iam:GetRole
+                  - iam:GetUser
+                  - iam:ListRoleTags
+                  - iam:ListUserTags
+                  - iam:ListAttachedRolePolicies
+                  - iam:ListRolePolicies
+                  - iam:GetRolePolicy
+                  - iam:ListAttachedUserPolicies
+                  - iam:ListUserPolicies
+                  - iam:GetUserPolicy
+                  - iam:ListGroupsForUser
+                  - iam:ListAttachedGroupPolicies
+                  - iam:ListGroupPolicies
+                  - iam:GetGroupPolicy
+                  - iam:GetPolicy
+                  - iam:GetPolicyVersion
                 Resource: '*'
 
 Outputs:

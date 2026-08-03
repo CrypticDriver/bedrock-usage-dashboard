@@ -98,6 +98,32 @@ Resources:
                   - logs:StopQuery
                   - logs:DescribeLogGroups
                 Resource: '*'
+              - Sid: IamRead
+                # 「IAM Principal 打标」面板(MAP 推荐的 map-migrated 分账方式):
+                # 列出有 Bedrock 调用权限的 Role/User 并读其标签。
+                # 纯只读,不含任何 iam:Tag*/Put*/Create* —— 看板只做检测与给出修复命令,
+                # 打标动作由使用者自己在目标账号执行。缺这组权限只是该面板不可用。
+                Effect: Allow
+                Action:
+                  - iam:ListRoles
+                  - iam:ListUsers
+                  - iam:GetRole
+                  - iam:GetUser
+                  - iam:ListRoleTags
+                  - iam:ListUserTags
+                  - iam:ListAttachedRolePolicies
+                  - iam:ListRolePolicies
+                  - iam:GetRolePolicy
+                  - iam:ListAttachedUserPolicies
+                  - iam:ListUserPolicies
+                  - iam:GetUserPolicy
+                  - iam:ListGroupsForUser
+                  - iam:ListAttachedGroupPolicies
+                  - iam:ListGroupPolicies
+                  - iam:GetGroupPolicy
+                  - iam:GetPolicy
+                  - iam:GetPolicyVersion
+                Resource: '*'
               - Sid: Cache
                 Effect: Allow
                 Action:
