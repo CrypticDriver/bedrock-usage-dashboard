@@ -10,10 +10,13 @@ Bedrock 用量/成本估算看板 — 单 Lambda(HTML + JSON + 趋势数据)
 import os
 import json
 import time
+import fnmatch
 import traceback
 import datetime as dt
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from threading import Lock
+from urllib.parse import unquote
 
 import boto3
 from botocore.config import Config
@@ -24,6 +27,12 @@ from botocore.httpsession import URLLib3Session
 # 快速失败:慢区/无用量区不拖累 global 扫描
 FAST = Config(connect_timeout=3, read_timeout=12, retries={"max_attempts": 2},
               max_pool_connections=50)
+
+# IAM 是全局单端点且限流很严,并发扫描下 FAST 的 2 次 legacy 重试会大量 Rate exceeded
+# (实测漏扫 principal)。adaptive 模式带客户端限速+更多退避,宁可慢也别漏。
+IAM_CFG = Config(connect_timeout=3, read_timeout=15,
+                 retries={"max_attempts": 8, "mode": "adaptive"},
+                 max_pool_connections=50)
 
 LAMBDA_REGION = os.environ.get("AWS_REGION", "us-west-2")
 PRICE_SECRET = os.environ.get("PRICE_SECRET", "bedrock-dashboard/prices")
@@ -69,6 +78,11 @@ def read_snapshot_cache():
 
 
 ALERT_STATE_KEY = "cache/alert-state.json"
+PRINCIPALS_KEY = "cache/principals.json"
+PRINCIPALS_JOB_KEY = "cache/principals-job.json"
+# 后台扫描任务的最长存活时间:超过就认为那次 invoke 已经死了(Lambda 超时/被杀),
+# 允许重新触发,否则一次意外失败会把按钮永久锁死。
+PRINCIPALS_JOB_TTL_SEC = 15 * 60
 
 
 def read_alert_state():
@@ -460,7 +474,8 @@ def _is_ignored(model_id, patterns):
 
 
 def run_alert_check(cfg=None, force_send=False):
-    """扫描窗口内非 app-inference-profile 用量(不可分账),命中则推钉钉。"""
+    """扫描窗口内不可按资源标签分账的用量(非 app-inference-profile),命中则推钉钉。
+    若已存在打了 map-migrated 的 IAM principal(MAP 新增的推荐分账方式),降级为巡检不告警。"""
     cfg = cfg or load_alerts()
     hours = max(1, min(48, int(cfg.get("window_hours", 6))))
     print(f"[alert_check] start: region={cfg.get('region', 'global')}, window={hours}h, "
@@ -475,6 +490,15 @@ def run_alert_check(cfg=None, force_send=False):
     bad = [r for r in raw_bad if not _is_ignored(r["id"], ignore)]
     ignored_count = len(raw_bad) - len(bad)
     total_bad = round(sum(r["cost"] for r in bad), 2)
+    # MAP 新增的 IAM principal tagging(2026-06-08 起生效): 调用方 Role/User 打了 map-migrated
+    # 就能分账,直连模型 ID 不再必然"无法分账"。检测到已打标 principal 就把告警降级为巡检,
+    # 否则每个窗口都在为已经合规的用量误报。只读缓存,IAM 扫描慢/失败绝不影响告警链路。
+    iam_tagged, iam_known = tagged_principal_state()
+    covered = iam_tagged > 0
+    alerting = bool(bad) and not covered
+    # 快照未扫全且计数为 0: 不能断言"没人打标",但也不能因此压掉告警(那会漏真问题)。
+    # 照常告警,只在消息里标注该结论未确认,让人知道要去面板确认而不是照着结论行动。
+    tag_unknown = bool(bad) and not covered and not iam_known
     # 推送节流: 同一窗口只推一次(按 window_hours 对齐)。EventBridge 扫描频率照旧
     # (定时任务还负责刷快照), 只是重叠窗口不再重复推送。0.9 容差防触发时刻抖动错过整槽。
     state = read_alert_state()
@@ -484,6 +508,8 @@ def run_alert_check(cfg=None, force_send=False):
               "start": start.strftime("%Y-%m-%d %H:%M"), "end": end.strftime("%Y-%m-%d %H:%M"),
               "violations": bad, "violation_cost": total_bad,
               "ignored_count": ignored_count, "throttled": throttled,
+              "iam_principal_tagged": iam_tagged, "iam_tag_known": iam_known,
+              "iam_tag_unknown": tag_unknown, "alerting": alerting,
               "enabled": cfg.get("enabled", False), "sent": False, "send_error": ""}
     # 无发现也推巡检报告(每窗口一条心跳,链路通断一目了然);节流对两种消息同样生效
     should_send = bool(cfg.get("webhook")) and (cfg.get("enabled") or force_send) and not throttled
@@ -514,9 +540,9 @@ def run_alert_check(cfg=None, force_send=False):
                     return name[len(p):].replace("anthropic.", ""), f"{p[:-1]} 跨区 profile"
             return name.replace("anthropic.", ""), "直连模型 ID"
 
-        blocks = [f"## {'🚨 Bedrock 无标签用量告警' if bad else '✅ Bedrock 用量巡检'}",
+        blocks = [f"## {'🚨 Bedrock 无标签用量告警' if alerting else '✅ Bedrock 用量巡检'}",
                   f"**近 {hours} 小时**（{result['start']} – {result['end']} UTC · {result['region']}）"]
-        if bad:
+        if alerting:
             blocks.append(f"共 **{len(bad)}** 个模型未走 app inference profile，"
                           f"**≈ ${total_bad}** 无法按标签归属：")
             items = []
@@ -527,18 +553,36 @@ def run_alert_check(cfg=None, force_send=False):
             if len(bad) > 10:
                 items.append(f"…等共 {len(bad)} 个模型")
             blocks.append("\n\n".join(items))
-            blocks.append("> 💡 为每个应用创建 **application inference profile**，"
-                          "调用时改用其 ARN，用量与费用即可按标签归属。")
+            blocks.append("> 💡 两种分账方式任选其一：\n"
+                          "> **① IAM principal 打标（推荐，无需改代码）** — 给调用 Bedrock 的 "
+                          "IAM Role/User 打 `map-migrated` 标签即可；\n"
+                          "> **② 资源打标** — 为每个应用创建 **application inference profile**，"
+                          "调用时改用其 ARN。\n"
+                          "> ⚠️ 资源标签优先级更高，两者只应选一种。")
+            if tag_unknown:
+                blocks.append("> ℹ️ 注：最近一次 IAM 扫描**未覆盖全部 principal**，"
+                              "「无人打标」这一判断**尚未确认**——可能已有 Role/User 打了标但没扫到。"
+                              "请到看板「🔑 IAM Principal 打标」面板点「⚡ 全量重扫(后台)」核实。")
+        elif bad and covered:
+            blocks.append(f"窗口内有 **{len(bad)}** 个模型未走 app inference profile"
+                          f"（≈ ${total_bad}），但已检测到 **{iam_tagged}** 个打了 "
+                          "`map-migrated` 标签的 IAM principal，这部分用量可经 "
+                          "**IAM principal 标签**分账，故不告警。")
+            blocks.append("> ⚠️ 请确认这些用量确实由已打标的 Role/User 发起；"
+                          "另注意资源标签优先级高于 IAM principal 标签，两者只应选一种。"
+                          "详见看板「🔑 IAM Principal 打标」面板。")
         else:
             blocks.append("当前窗口内未发现无标签用量，全部调用均带标签可归属。"
                           if not force_send else "✅ 测试消息：当前窗口内未发现无标签用量。")
         if ignored_count:
             blocks.append(f"_已按忽略清单跳过 {ignored_count} 个模型_")
         print(f"[dingtalk] sending: has_secret={bool(cfg.get('sign_secret'))}, "
-              f"violations={len(bad)}, force_send={force_send}")
+              f"violations={len(bad)}, alerting={alerting}, "
+              f"iam_principal_tagged={iam_tagged}, iam_tag_known={iam_known}, "
+              f"force_send={force_send}")
         try:
             resp = dingtalk_send(cfg["webhook"], cfg.get("sign_secret", ""),
-                                 "Bedrock 无标签用量告警" if bad else "Bedrock 用量巡检",
+                                 "Bedrock 无标签用量告警" if alerting else "Bedrock 用量巡检",
                                  "\n\n".join(blocks))
             if resp.get("errcode") == 0:
                 result["sent"] = True
@@ -987,6 +1031,18 @@ def gray_area(region, log_group, start, end, sess=None):
             "rows": rows}
 
 
+def tag_mis_reason(value, expected):
+    """打了 map-migrated 但值与期望值不符时的原因。CE 账单面板与 IAM principal 面板共用,
+    避免两处判定分叉。expected 为空表示不校验值,此时不存在"无效打标"。"""
+    if not expected:
+        return ""
+    if value.strip() == expected:
+        return "首尾多了空格"
+    if value.strip().lower() == expected.lower():
+        return "大小写不一致"
+    return "值不匹配"
+
+
 def ce_cost(start, end, sess=None, expected=None):
     ce = (sess or boto3).client("ce", region_name="us-east-1")
     s = start.date().isoformat()
@@ -1047,13 +1103,8 @@ def ce_cost(start, end, sess=None, expected=None):
                 "激活为成本分配标签(激活后仅对之后产生的账单生效,历史不回填)")
 
     def _mis_reason(v):
-        if not expected:
-            return ""
-        if v.strip() == expected:
-            return "首尾多了空格"
-        if v.strip().lower() == expected.lower():
-            return "大小写不一致"
-        return "值不匹配"
+        return tag_mis_reason(v, expected)
+
     return {"start": s, "end": e_incl, "total": round(total, 2),
             "tagged": round(tagged, 2), "untagged": round(untagged, 2),
             "mistagged": round(mistagged, 2), "expectedTag": expected or "",
@@ -1117,6 +1168,510 @@ def ce_cost_all(start, end):
                      "(激活后仅对新账单生效,历史不回填)" if total > 0 and tagged == 0 and mistagged == 0 else "")}
 
 
+# ---------------------------------------------------------------------------
+# IAM principal 打标(MAP 推荐方式: 给调用 Bedrock 的 Role/User 打 map-migrated)
+# https://docs.aws.amazon.com/MAP/latest/userguide/bedrock-map-tagging.html
+# ---------------------------------------------------------------------------
+MAP_TAG_KEY = "map-migrated"
+IAM_SCAN_MAX_ROLES = 1500     # 单账号扫描上限,触顶置 truncated 而非静默截断
+IAM_SCAN_MAX_USERS = 500
+IAM_SCAN_WORKERS = 8          # IAM 是全局单端点且有限流,并发别开太大
+IAM_SCAN_RESERVE_SEC = 30     # 留给序列化/返回的余量,避免整个请求被 Lambda 掐断
+# 页面实时扫描走 CloudFront,其 OriginReadTimeout=60s(见 template.yaml)。
+# 超过就是 504、用户啥也看不到,而 Lambda 还在白烧。故实时路径的预算卡在这条线以内,
+# 到点返回 truncated=True 的部分结果(诚实降级)。EventBridge 预热快照不经 CloudFront,
+# 用完整 Lambda 预算,所以"快照通常是全量的、实时是尽力而为"。
+IAM_SCAN_LIVE_BUDGET_SEC = 45
+
+# 判定"这个 principal 会不会调 Bedrock"用的探针动作(全小写)。
+# 策略里的 Action 是通配模式(bedrock:*、bedrock:InvokeModel*),故用 fnmatch 反向匹配探针。
+BEDROCK_PROBES = (
+    "bedrock:invokemodel",
+    "bedrock:invokemodelwithresponsestream",
+    "bedrock:converse",
+    "bedrock:conversestream",
+    "bedrock:invokeagent",
+    "bedrock-agentcore:invokeagentruntime",
+    "bedrock-mantle:createresponse",
+    "bedrock-mantle:createchatcompletion",
+)
+
+
+def _epoch_of(day):
+    try:
+        return dt.datetime.fromisoformat(day).replace(tzinfo=dt.UTC).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _as_doc(d):
+    """策略文档归一化。boto3 一般已 url-decode 成 dict,老版本/异常路径可能是字符串。"""
+    if isinstance(d, dict):
+        return d
+    if isinstance(d, str):
+        try:
+            return json.loads(unquote(d))
+        except (TypeError, ValueError):
+            return {}
+    return {}
+
+
+def _policy_grants_bedrock(doc):
+    """静态解析一份策略文档:是否 Allow 了任一 Bedrock 调用动作。
+    返回 (granted, broad);broad=True 表示只靠 Action:"*" / NotAction 这类宽泛授权命中,
+    并非显式给了 Bedrock 权限。**不求解 Deny / 权限边界 / SCP / Condition / Resource** ——
+    页面文案已把这个局限写明,宁可多列(便于人工确认)也不漏掉真在调用的 principal。"""
+    stmts = doc.get("Statement") if isinstance(doc, dict) else None
+    if isinstance(stmts, dict):
+        stmts = [stmts]
+    if not isinstance(stmts, list):
+        return False, False
+    explicit = broad = False
+    for st in stmts:
+        if not isinstance(st, dict) or st.get("Effect") != "Allow":
+            continue
+        if "NotAction" in st:
+            na = st["NotAction"]
+            pats = [str(p).lower() for p in ([na] if isinstance(na, str) else (na or []))]
+            if any(not any(fnmatch.fnmatchcase(pb, p) for p in pats) for pb in BEDROCK_PROBES):
+                broad = True
+            continue
+        acts = st.get("Action")
+        for a in ([acts] if isinstance(acts, str) else (acts or [])):
+            p = str(a).lower()
+            if p == "*":
+                broad = True
+            elif any(fnmatch.fnmatchcase(pb, p) for pb in BEDROCK_PROBES):
+                explicit = True
+                break
+    return (explicit or broad), (broad and not explicit)
+
+
+_IAM_INLINE_API = {"role": ("list_role_policies", "get_role_policy", "RoleName"),
+                   "user": ("list_user_policies", "get_user_policy", "UserName"),
+                   "group": ("list_group_policies", "get_group_policy", "GroupName")}
+_IAM_ATTACHED_API = {"role": ("list_attached_role_policies", "RoleName"),
+                     "user": ("list_attached_user_policies", "UserName"),
+                     "group": ("list_attached_group_policies", "GroupName")}
+
+
+def _inline_docs(iam, kind, name):
+    lister, getter, key = _IAM_INLINE_API[kind]
+    out = []
+    for page in iam.get_paginator(lister).paginate(**{key: name}):
+        for pn in page.get("PolicyNames", []):
+            doc = getattr(iam, getter)(**{key: name, "PolicyName": pn})["PolicyDocument"]
+            out.append((pn, _as_doc(doc)))
+    return out
+
+
+def _attached_policies(iam, kind, name):
+    lister, key = _IAM_ATTACHED_API[kind]
+    out = []
+    for page in iam.get_paginator(lister).paginate(**{key: name}):
+        for p in page.get("AttachedPolicies", []):
+            out.append((p.get("PolicyName") or (p.get("PolicyArn") or "").split("/")[-1],
+                        p.get("PolicyArn", "")))
+    return out
+
+
+def _managed_policy_doc(iam, arn, cache, lock):
+    """取托管策略默认版本文档,按 ARN 全账号缓存 —— AmazonBedrockFullAccess 这类只拉一次。"""
+    with lock:
+        if arn in cache:
+            return cache[arn]
+    doc = {}
+    try:
+        ver = iam.get_policy(PolicyArn=arn)["Policy"]["DefaultVersionId"]
+        doc = _as_doc(iam.get_policy_version(
+            PolicyArn=arn, VersionId=ver)["PolicyVersion"]["Document"])
+    except Exception as e:
+        print(f"[principals] managed policy unreadable {arn}: {e!r}")
+    with lock:
+        cache[arn] = doc
+    return doc
+
+
+def _grants_for(iam, kind, name, mp_cache, mp_lock):
+    """单个 principal(或组)的内联 + 托管策略是否给了 Bedrock 调用权限。
+    返回 (via[], broad):via 是命中的策略名,用于页面上说明"凭什么算它是 Bedrock principal"。"""
+    via, broad = [], False
+    for pn, doc in _inline_docs(iam, kind, name):
+        g, b = _policy_grants_bedrock(doc)
+        if g:
+            via.append(f"内联 {pn}")
+            broad = broad or b
+    for pn, arn in _attached_policies(iam, kind, name):
+        if not arn:
+            continue
+        g, b = _policy_grants_bedrock(_managed_policy_doc(iam, arn, mp_cache, mp_lock))
+        if g:
+            via.append(pn)
+            broad = broad or b
+    return via, broad
+
+
+def _user_group_grants(iam, user, mp_cache, mp_lock, grp_cache, grp_lock):
+    """用户还可能通过组拿到 Bedrock 权限。组结果按组名缓存(多个用户常共用同一组)。"""
+    via, broad = [], False
+    groups = []
+    try:
+        for page in iam.get_paginator("list_groups_for_user").paginate(UserName=user):
+            groups += [g["GroupName"] for g in page.get("Groups", [])]
+    except Exception as e:
+        print(f"[principals] list_groups_for_user {user} failed: {e!r}")
+        return via, broad
+    for gname in groups:
+        with grp_lock:
+            hit = grp_cache.get(gname)
+        if hit is None:
+            try:
+                hit = _grants_for(iam, "group", gname, mp_cache, mp_lock)
+            except Exception as e:
+                print(f"[principals] group {gname} scan failed: {e!r}")
+                hit = ([], False)
+            with grp_lock:
+                grp_cache[gname] = hit
+        gvia, gb = hit
+        via += [f"组 {gname}/{v}" for v in gvia]
+        broad = broad or gb
+    return via, broad
+
+
+def _tag_status(tags, expected):
+    """把 principal 的标签字典判成 tagged / mistagged / untagged。
+    IAM 标签键区分大小写,键写成 Map-Migrated 的 MAP 不认,故单独识别出来提示。"""
+    val = tags.get(MAP_TAG_KEY)
+    if val is None:
+        alt = next((k for k in tags if k.lower() == MAP_TAG_KEY), None)
+        if alt:
+            return "mistagged", tags[alt], f"标签键大小写不符(是 {alt},应为 {MAP_TAG_KEY})"
+        return "untagged", "", ""
+    if not val:
+        return "untagged", "", "标签键存在但值为空"
+    if expected and val != expected:
+        return "mistagged", val, tag_mis_reason(val, expected)
+    return "tagged", val, ""
+
+
+def _principal_tags(iam, kind, name):
+    """取标签(+ 角色最后使用时间)。get_role 一次拿齐 Tags 与 RoleLastUsed;
+    若该权限被拒,退回 list_role_tags/list_user_tags 只取标签。"""
+    tags, last_used = {}, ""
+    try:
+        if kind == "role":
+            r = iam.get_role(RoleName=name)["Role"]
+            d = (r.get("RoleLastUsed") or {}).get("LastUsedDate")
+            last_used = d.date().isoformat() if d else ""
+        else:
+            r = iam.get_user(UserName=name)["User"]
+        tags = {t["Key"]: t.get("Value", "") for t in r.get("Tags", [])}
+    except Exception as e:
+        try:
+            lister = "list_role_tags" if kind == "role" else "list_user_tags"
+            key = "RoleName" if kind == "role" else "UserName"
+            for page in iam.get_paginator(lister).paginate(**{key: name}):
+                tags.update({t["Key"]: t.get("Value", "") for t in page.get("Tags", [])})
+        except Exception:
+            raise e
+    return tags, last_used
+
+
+def bedrock_principals(sess=None, expected="", deadline=None,
+                       max_roles=IAM_SCAN_MAX_ROLES, max_users=IAM_SCAN_MAX_USERS):
+    """扫描单个账号里"有 Bedrock 调用权限"的 IAM Role/User 及其 map-migrated 打标状态。
+    IAM 是全局服务,不需要按区域循环。触顶或接近超时会 truncated=True 并如实报告已扫数量。"""
+    sess = sess or DEFAULT_SESS
+    iam = sess.client("iam", config=IAM_CFG)
+
+    def past():
+        return deadline is not None and time.monotonic() > deadline
+
+    truncated = False
+    hit_cap = False      # 与"时间到"分开记,note 里才能准确归因
+    candidates = []      # (kind, name, arn, path)
+    roles_scanned = users_scanned = 0
+    for page in iam.get_paginator("list_roles").paginate():
+        for r in page["Roles"]:
+            # 服务关联角色由 AWS 托管、用户无法打标,列出来只是噪音
+            if (r.get("Path") or "/").startswith("/aws-service-role/"):
+                continue
+            roles_scanned += 1
+            candidates.append(("role", r["RoleName"], r.get("Arn", ""), r.get("Path", "/")))
+            if roles_scanned >= max_roles:
+                truncated = hit_cap = True
+                break
+        if truncated or past():
+            truncated = truncated or past()
+            break
+    if not past():
+        stop = False
+        for page in iam.get_paginator("list_users").paginate():
+            for u in page["Users"]:
+                users_scanned += 1
+                candidates.append(("user", u["UserName"], u.get("Arn", ""), u.get("Path", "/")))
+                if users_scanned >= max_users:
+                    truncated = stop = hit_cap = True
+                    break
+            if stop or past():
+                truncated = truncated or past()
+                break
+
+    mp_cache, mp_lock = {}, Lock()
+    grp_cache, grp_lock = {}, Lock()
+    rows, skipped, failed = [], 0, 0
+
+    def work(item):
+        kind, name, arn, path = item
+        if past():
+            return "skip"
+        via, broad = _grants_for(iam, kind, name, mp_cache, mp_lock)
+        if kind == "user":
+            gvia, gb = _user_group_grants(iam, name, mp_cache, mp_lock, grp_cache, grp_lock)
+            via += gvia
+            broad = broad or gb
+        if not via:
+            return None
+        tags, last_used = _principal_tags(iam, kind, name)
+        status, val, reason = _tag_status(tags, expected)
+        return {"type": kind, "name": name, "arn": arn, "path": path,
+                "via": via[:6], "broad": broad, "status": status,
+                "tagValue": val, "reason": reason, "lastUsed": last_used}
+
+    with ThreadPoolExecutor(max_workers=IAM_SCAN_WORKERS) as ex:
+        for fut in as_completed([ex.submit(work, c) for c in candidates]):
+            try:
+                r = fut.result()
+            except Exception as e:
+                # 权限/限流等读取失败:该 principal 打标状态未知,计入 failed 并如实上报
+                print(f"[principals] principal scan failed: {e!r}")
+                failed += 1
+                continue
+            if r == "skip":
+                skipped += 1
+            elif r:
+                rows.append(r)
+    unknown = skipped + failed
+    if unknown:
+        truncated = True
+        print(f"[principals] {unknown} principal(s) not evaluated "
+              f"(deadline={skipped}, error={failed})")
+
+    order = {"mistagged": 0, "untagged": 1, "tagged": 2}
+    rows.sort(key=lambda x: (order.get(x["status"], 9), x["lastUsed"] == "",
+                             -_epoch_of(x["lastUsed"]), x["name"]))
+    counts = {s: sum(1 for r in rows if r["status"] == s)
+              for s in ("tagged", "mistagged", "untagged")}
+    note = ""
+    if truncated:
+        # 归因要准:"没扫到"和"扫了但读不出来"是两回事,后者常见于 IAM 限流
+        bits = []
+        if hit_cap:
+            bits.append("达扫描上限")
+        if skipped:
+            bits.append(f"{skipped} 个因时间到未评估")
+        if failed:
+            bits.append(f"{failed} 个因限流/权限读取失败")
+        why = "、".join(bits) or "上限或时间到"
+        note = (f"扫描未覆盖全部 principal(已扫 {roles_scanned} 角色 / {users_scanned} 用户;"
+                f"{why});这些 principal 的打标状态未知,以上计数仅代表已评估范围")
+    elif not rows and (roles_scanned or users_scanned):
+        note = "未发现有 Bedrock 调用权限的 Role/User(仅基于静态策略解析,不含 SCP/权限边界)"
+    return {"candidates": len(rows), "roles_scanned": roles_scanned,
+            "users_scanned": users_scanned, "truncated": truncated,
+            "notEvaluated": unknown,
+            "taggedPct": round(counts["tagged"] / len(rows) * 100, 1) if rows else 0.0,
+            "rows": rows, "note": note, **counts}
+
+
+def _scan_deadline(context, reserve=IAM_SCAN_RESERVE_SEC, max_budget=None):
+    """扫描截止时刻(time.monotonic 口径)。max_budget 用于把实时请求卡在
+    CloudFront 超时以内 —— 否则 Lambda 还在跑、用户已经吃到 504。"""
+    try:
+        budget = context.get_remaining_time_in_millis() / 1000.0 - reserve
+    except Exception:
+        budget = 240.0
+    if max_budget is not None:
+        budget = min(budget, max_budget)
+    return time.monotonic() + max(15.0, budget)
+
+
+def bedrock_principals_all(context=None, limit=None, max_budget=None):
+    """中心 + 全部注册账号,一账号一组。单账号失败只在该组填 error,不拖垮整个面板。"""
+    try:
+        central_id = central_role_arn().split(":")[4]
+    except Exception:
+        central_id = "中心账号"
+    targets = [{"accountId": None, "label": f"中心 {central_id}"}]
+    for a in load_accounts():
+        if a["accountId"] == central_id:
+            continue
+        targets.append({"accountId": a["accountId"],
+                        "label": a.get("label") or a["accountId"]})
+    try:
+        n = int(limit) if limit else 0
+    except (TypeError, ValueError):
+        n = 0
+    # 非正数/非数字一律当没传,避免 limit=0 被 max(1,...) 夹成"只扫 1 个"这种没意义的结果
+    cap = min(2000, n) if n > 0 else IAM_SCAN_MAX_ROLES
+    expected = load_settings().get("map_tag_value", "")
+    deadline = _scan_deadline(context, max_budget=max_budget)
+    accounts = []
+    for t in targets:
+        acct = t["accountId"] or central_id
+        try:
+            d = bedrock_principals(session_for(t["accountId"]), expected, deadline,
+                                   max_roles=cap, max_users=min(cap, IAM_SCAN_MAX_USERS))
+            accounts.append({"account": acct, "label": t["label"], **d})
+        except Exception as e:
+            msg = str(e)
+            if "AccessDenied" in msg or "not authorized" in msg:
+                msg = ("权限不足:该账号的 BedrockUsageReader 角色缺少 iam 只读权限"
+                       "(ListRoles/ListUsers/GetRole/GetUser/List*Policies/GetPolicy*),"
+                       "按 docs/UPGRADE-1.8.0.md 升级该角色后重试")
+            print(f"[principals_all] account={acct} FAILED: {e!r}")
+            accounts.append({"account": acct, "label": t["label"], "error": msg[:300],
+                             "rows": [], "candidates": 0, "tagged": 0,
+                             "mistagged": 0, "untagged": 0})
+    tot = {k: sum(a.get(k, 0) for a in accounts)
+           for k in ("candidates", "tagged", "mistagged", "untagged")}
+    tot["taggedPct"] = (round(tot["tagged"] / tot["candidates"] * 100, 1)
+                        if tot["candidates"] else 0.0)
+    note = ""
+    if tot["candidates"] and not tot["tagged"]:
+        note = ("没有任何 Bedrock principal 打上 map-migrated 标签:MAP 推荐做法是给调用 Bedrock 的"
+                "IAM Role/User 打该标签(2026-06-08 起生效),无需改应用代码。"
+                "注意资源标签(application inference profile)优先级更高,两种方式只应选一种")
+    if any(a.get("truncated") for a in accounts):
+        # 截断提示必须叠加而非被覆盖 —— 否则"一个都没打标"的结论会盖住"其实没扫全"这个前提
+        note = (note + " ") if note else ""
+        note += ("⚠️ 部分账号未扫全(达上限或时间到),以上计数与占比仅代表已扫范围。"
+                 "实时扫描受网关超时限制只能尽力而为,定时预热的快照通常更全")
+    return {"expectedTag": expected, "totals": tot, "accounts": accounts, "note": note}
+
+
+def _is_partial(d):
+    """本次扫描是否没覆盖到位(有账号被截断、或有 principal 未评估)。
+    账号级 error(如成员账号缺 IAM 只读权限)是稳定状态而非降级,不算 partial ——
+    否则那种账号一直存在,快照就永远不许更新了。"""
+    return any(a.get("truncated") or a.get("notEvaluated")
+               for a in (d.get("accounts") or []))
+
+
+def write_principals_cache(context=None, data=None):
+    """IAM 全量扫描慢,随定时任务预热快照,页面默认读快照秒开。
+
+    残缺结果不覆盖仍然有效的完整快照:否则 totals.tagged 会被写低,
+    告警侧据此判定"没人打标"从而误报。read_principals_cache 只返回未过期的,
+    所以旧快照一旦超 TTL 就不再拦着写,陈旧程度仍受 TTL 约束。"""
+    if not CACHE_BUCKET:
+        return False
+    data = data if data is not None else bedrock_principals_all(context=context)
+    partial = _is_partial(data)
+    if partial:
+        old = read_principals_cache()
+        if old and not _is_partial(old):
+            print("[principals] skip cache write: 本次未扫全,保留仍有效的完整快照 "
+                  f"(old tagged={(old.get('totals') or {}).get('tagged')}, "
+                  f"new tagged={(data.get('totals') or {}).get('tagged')})")
+            return False
+    # 不改调用方手里的 dict: 实时路径要把原对象返给前端,混入 cached_at 会被误显示成"快照"
+    payload = dict(data)
+    payload["cached_at"] = dt.datetime.now(dt.UTC).strftime("%Y-%m-%d %H:%M")
+    payload["partial"] = partial
+    boto3.client("s3", region_name=LAMBDA_REGION).put_object(
+        Bucket=CACHE_BUCKET, Key=PRINCIPALS_KEY,
+        Body=json.dumps(payload).encode(), ContentType="application/json")
+    if partial:
+        print("[principals] cache written but marked partial=1 (无更好的快照可留)")
+    return True
+
+
+def read_principals_cache():
+    if not CACHE_BUCKET:
+        return None
+    try:
+        s3 = boto3.client("s3", region_name=LAMBDA_REGION)
+        obj = s3.get_object(Bucket=CACHE_BUCKET, Key=PRINCIPALS_KEY)
+        if (dt.datetime.now(dt.UTC) - obj["LastModified"]).total_seconds() > CACHE_MAX_AGE_SEC:
+            return None
+        return json.loads(obj["Body"].read())
+    except Exception:
+        return None
+
+
+def _job_s3():
+    return boto3.client("s3", region_name=LAMBDA_REGION)
+
+
+def read_principals_job():
+    """后台扫描任务状态。过期(疑似 invoke 已死)一律当作失败,否则按钮会被永久锁死。"""
+    if not CACHE_BUCKET:
+        return None
+    try:
+        obj = _job_s3().get_object(Bucket=CACHE_BUCKET, Key=PRINCIPALS_JOB_KEY)
+        age = (dt.datetime.now(dt.UTC) - obj["LastModified"]).total_seconds()
+        job = json.loads(obj["Body"].read())
+        if job.get("state") == "running" and age > PRINCIPALS_JOB_TTL_SEC:
+            print(f"[principals] stale running job ({age:.0f}s old), treating as failed")
+            return {"state": "failed", "error": "上次后台扫描超时或中断", "stale": True,
+                    "started_at": job.get("started_at", ""), "age_sec": int(age)}
+        job["age_sec"] = int(age)
+        return job
+    except Exception:
+        return None
+
+
+def write_principals_job(state, **extra):
+    if not CACHE_BUCKET:
+        return
+    body = {"state": state, "at": dt.datetime.now(dt.UTC).strftime("%Y-%m-%d %H:%M:%S"), **extra}
+    try:
+        _job_s3().put_object(Bucket=CACHE_BUCKET, Key=PRINCIPALS_JOB_KEY,
+                             Body=json.dumps(body).encode(), ContentType="application/json")
+    except Exception as e:
+        print(f"[principals] job state write failed: {e!r}")
+
+
+def run_principals_scan(context=None):
+    """后台全量扫描(异步 invoke 触发,不经 CloudFront 故可用完整 Lambda 预算)。
+    进度落 S3 供前端轮询 —— 异步 invoke 拿不到返回值。"""
+    started = dt.datetime.now(dt.UTC).strftime("%Y-%m-%d %H:%M:%S")
+    write_principals_job("running", started_at=started)
+    try:
+        data = bedrock_principals_all(context=context)
+        written = write_principals_cache(data=data)
+        tot = data.get("totals") or {}
+        partial = _is_partial(data)
+        write_principals_job("done", started_at=started, partial=partial,
+                             cache_written=written, candidates=tot.get("candidates", 0),
+                             tagged=tot.get("tagged", 0))
+        print(f"[principals] background scan done: candidates={tot.get('candidates')}, "
+              f"partial={partial}, cache_written={written}")
+        return True
+    except Exception as e:
+        print(f"[principals] background scan failed: {e!r}")
+        traceback.print_exc()
+        write_principals_job("failed", started_at=started, error=str(e)[:300])
+        return False
+
+
+def tagged_principal_state():
+    """(已打标 principal 数, 该结论是否可信)。仅读缓存 —— 告警链路不能因 IAM 扫描慢/失败而挂。
+
+    快照未扫全且计数为 0 时返回 known=False:那 0 可能只是"没扫到",
+    不能据此断言"没人打标"。计数 >0 即便快照未扫全也可信(下界已足够证明存在打标)。"""
+    snap = read_principals_cache()
+    if not snap:
+        return 0, False
+    try:
+        n = int((snap.get("totals") or {}).get("tagged", 0) or 0)
+    except (TypeError, ValueError):
+        n = 0
+    return n, (n > 0 or not snap.get("partial"))
+
+
+
 def _range(q):
     now = dt.datetime.now(dt.UTC)
     try:
@@ -1143,8 +1698,14 @@ def _json(obj, code=200):
 
 
 def lambda_handler(event, context):
+    if isinstance(event, dict) and not event.get("queryStringParameters") and event.get("action") == "scan_principals":
+        return {"principals_scanned": run_principals_scan(context)}
     if isinstance(event, dict) and not event.get("queryStringParameters") and event.get("action") == "refresh_cache":
-        return {"cache_refreshed": write_snapshot_cache()}
+        out = {"cache_refreshed": write_snapshot_cache()}
+        # 走 run_principals_scan 而非直接 write_principals_cache: 顺带维护 job 状态,
+        # 页面才知道"最近一次全量扫描"是什么时候、结果如何
+        out["principals_refreshed"] = run_principals_scan(context)
+        return out
     if isinstance(event, dict) and not event.get("queryStringParameters") and (
             event.get("action") == "alert_check" or event.get("source") == "aws.events"):
         t0 = time.monotonic()
@@ -1160,6 +1721,10 @@ def lambda_handler(event, context):
             print(f"[snapshot] refreshed in {time.monotonic() - t1:.1f}s")
         except Exception as e:
             print(f"cache refresh failed: {e!r}")
+        # IAM 全量扫描慢,放在最后预热:失败或没时间只影响面板首屏,不影响告警结论
+        t2 = time.monotonic()
+        result["principals_refreshed"] = run_principals_scan(context)
+        print(f"[principals] cache refresh took {time.monotonic() - t2:.1f}s")
         return result
     q = (event.get("queryStringParameters") or {}) if isinstance(event, dict) else {}
     q = q or {}
@@ -1252,6 +1817,40 @@ def lambda_handler(event, context):
             return _json(logging_log_group(region, session_for(account)))
         if fmt == "cecost":
             return _json(ce_cost_all(start, end))
+        if fmt == "principals":
+            if q.get("cached") == "1":
+                snap = read_principals_cache()
+                if snap:
+                    return _json(snap)
+            data = bedrock_principals_all(context=context, limit=q.get("limit"),
+                                          max_budget=IAM_SCAN_LIVE_BUDGET_SEC)
+            # 同步实时扫描的结果也回写快照(带残缺保护,不会把完整快照写坏),
+            # 否则打完标后页面与告警链路的结论会不一致直到下次定时任务。
+            try:
+                write_principals_cache(data=data)
+            except Exception as e:
+                print(f"[principals] write-back after live scan failed: {e!r}")
+            return _json(data)
+        if q.get("action") == "scan_principals":
+            # 异步全量扫描: 同步路径受 CloudFront 60s 限制,大账号注定扫不全。
+            # 这里只排队后立即返回,由前端轮询 principals_job 拿结果。
+            job = read_principals_job()
+            if job and job.get("state") == "running":
+                return _json({"ok": True, "queued": False, "job": job,
+                              "note": "已有后台扫描在进行中"})
+            write_principals_job("running", started_at=dt.datetime.now(dt.UTC)
+                                 .strftime("%Y-%m-%d %H:%M:%S"), queued_by="page")
+            try:
+                boto3.client("lambda", region_name=LAMBDA_REGION).invoke(
+                    FunctionName=context.function_name, InvocationType="Event",
+                    Payload=json.dumps({"action": "scan_principals"}).encode())
+            except Exception as e:
+                # 排队失败要把 running 状态清掉,否则前端会一直轮询一个不存在的任务
+                write_principals_job("failed", error=f"排队失败: {str(e)[:200]}")
+                return _json({"error": f"无法启动后台扫描: {e}"}, 500)
+            return _json({"ok": True, "queued": True})
+        if fmt == "principals_job":
+            return _json({"job": read_principals_job() or {"state": "none"}})
         if fmt == "errors":
             return _json(error_stats(region, start, end, session_for(account)))
         if fmt == "gray":
@@ -1331,7 +1930,27 @@ tbody tr.subrow td:first-child{padding-left:26px}
 .pill{font-size:11px;color:#9aa3c7;background:rgba(255,255,255,.06);padding:2px 8px;border-radius:999px;white-space:nowrap;display:inline-block}
 .pill.ok{color:#34d399;background:rgba(52,211,153,.1);border:1px solid rgba(52,211,153,.3)}
 .pill.warn{color:#fbbf24;background:rgba(251,191,36,.08);border:1px solid rgba(251,191,36,.3)}
+.pill.bad{color:#fb7185;background:rgba(251,113,133,.08);border:1px solid rgba(251,113,133,.35)}
 .unknown{color:#fb7185}
+/* IAM principal 表:长命令曾把名称列撑爆、把「最后使用/标签值」表头挤成竖排,
+   故固定表头不换行 + 给各列宽度约束,修复命令改为整宽子行不参与列宽竞争 */
+#prTable th{white-space:nowrap}
+#prTable td{vertical-align:top}
+.prname{display:inline-block;max-width:340px;word-break:break-all;color:#e6ebff;font-size:12.5px}
+#prTable td.prvia{max-width:260px;word-break:break-word;font-size:12px}
+tr.prcmd td{padding:0 14px 9px 14px;background:transparent}
+tr.prcmd{border-top:none}
+.prcmdbox{display:flex;align-items:center;gap:8px;background:rgba(255,255,255,.05);
+  border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:5px 8px}
+.prcmdbox code{flex:1;min-width:0;white-space:nowrap;overflow-x:auto;font-size:11px;color:#9fe7c4}
+.prbar{display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin:10px 0}
+.prseg-wrap{display:inline-flex;gap:8px;align-items:center}
+.prbar .seg{display:flex;gap:4px;background:rgba(255,255,255,.05);border-radius:10px;padding:3px}
+.prbar .seg button{background:transparent;border:none;color:#9aa3c7;padding:5px 11px;border-radius:8px;font-size:12px}
+.prbar .seg button.on{background:rgba(99,102,241,.28);color:#e6ebff}
+.prpager{display:flex;gap:8px;align-items:center;justify-content:flex-end;margin:10px 0 4px;font-size:12px;color:#8b94b8}
+.prpager button{padding:4px 10px;font-size:12px}
+.prpager button:disabled{opacity:.35;cursor:not-allowed}
 .foot{color:#6b7494;font-size:12px;margin-top:18px;line-height:1.6}
 .loading{color:#8b94b8;padding:40px;text-align:center}
 .err{color:#fb7185;padding:20px;background:rgba(251,113,133,.08);border-radius:12px}
@@ -1431,6 +2050,53 @@ tbody tr.subrow td:first-child{padding-left:26px}
         数据来自 <b>Cost Explorer 真实账单</b>(UnblendedCost,仅 Amazon Bedrock Service 账单行,非估算),按上方日期区间查询,一次覆盖<b>中心 + 全部注册账号</b>;账号/区域选择器不影响本面板。
         map-migrated 拆分需要各账号已激活该成本分配标签;跨账号需 reader 角色有 ce:GetCostAndUsage。每账号每次查询产生 $0.02 CE API 费用。
         <b>标签值校验:</b>设置 map-migrated 标签值后,只有值完全一致才计入“已打标”;值不符(常见手滑多敲空格)的单独列为<b>无效打标</b>并列出具体错误值,方便去资源上改标。
+      </div>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="phead" onclick="togglePrincipals()">
+      <h3>🔑 IAM Principal 打标 <span class="muted">· map-migrated · 有 Bedrock 调用权限的 Role/User · 跨账号</span></h3>
+      <span class="chev" id="prToggle">展开 ▾</span>
+    </div>
+    <div id="prWrap" style="display:none">
+      <div class="chartbar" style="margin:12px 0">
+        <button onclick="loadPrincipals(0)">🔄 刷新(快照)</button>
+        <button class="preset" onclick="scanPrincipals()" id="prScanBtn">⚡ 全量重扫(后台)</button>
+        <span id="prMeta" class="muted"></span>
+      </div>
+      <div class="cards" id="prCards"></div>
+      <div class="prbar" id="prBar" style="display:none">
+        <span class="prseg-wrap" id="prAcctWrap" style="display:none">
+          <span class="muted">账号</span>
+          <select id="prAcct" onchange="prSetAcct(this.value)"></select>
+        </span>
+        <span class="prseg-wrap" id="prFilterWrap" style="display:none">
+          <span class="muted">筛选</span>
+          <span class="seg" id="prSeg">
+            <button class="on" data-f="all" onclick="prSetFilter('all')">全部</button>
+            <button data-f="untagged" onclick="prSetFilter('untagged')">✗ 未打标</button>
+            <button data-f="mistagged" onclick="prSetFilter('mistagged')">⚠️ 无效打标</button>
+            <button data-f="tagged" onclick="prSetFilter('tagged')">✓ 已打标</button>
+          </span>
+          <span class="muted" style="margin-left:4px">每页</span>
+          <select id="prSize" onchange="prSetSize(this.value)">
+            <option value="10">10</option><option value="25">25</option>
+            <option value="50">50</option><option value="100">100</option>
+            <option value="0">全部</option>
+          </select>
+        </span>
+      </div>
+      <div id="prTable"></div>
+      <div class="muted" style="margin-top:12px;line-height:1.7">
+        <b>MAP 推荐做法</b>(2026-06-08 起生效):给调用 Bedrock / AgentCore 的 IAM <b>Role 或 User</b> 打 <code>map-migrated</code> 标签即可分账,
+        <b>无需创建 application inference profile、无需改应用代码</b>。标签值格式为 <code>mig</code> + MPE ID,期望值在上方「真实账单」面板设置,此处据其校验。
+        <br/>⚠️ <b>资源标签优先级更高</b>:若同时存在 application inference profile 的资源标签与 IAM principal 标签,以资源标签为准 —— 两种方式<b>只应选一种</b>。
+        另注意:MAP 迁移开始前就在用的角色,其用量会被排除在 MAP spend 之外。
+        <br/><b>判定口径与局限:</b>「有 Bedrock 调用权限」基于<b>静态解析</b>内联 + 托管策略(用户还会看其所属组),
+        命中 <code>bedrock:InvokeModel/Converse</code>、<code>bedrock-mantle:*</code>、<code>bedrock-agentcore:*</code> 等动作即入选;
+        <b>不求解 Deny 语句 / 权限边界 / SCP / Condition</b>,仅靠 <code>Action:"*"</code> 命中的会标注<span class="pill warn">宽泛授权</span>需人工确认;
+        AWS 服务关联角色(<code>/aws-service-role/</code>)不可打标故跳过。宁可多列也不漏,请以实际调用方为准。
+        <br/>IAM 全量扫描较慢,默认读<b>定时任务预热的快照</b>;「⚡ 全量重扫(后台)」在后台跑完整扫描(不受网关 60s 限制),完成后自动刷新。账号/区域/日期选择器不影响本面板(IAM 为全局服务)。
       </div>
     </div>
   </div>
@@ -1551,7 +2217,7 @@ tbody tr.subrow td:first-child{padding-left:26px}
   </div>
   <div class="panel">
     <div class="phead" onclick="toggleAlertCfg()">
-      <h3>🔔 分账告警 <span class="muted">· 非 app inference profile 用量 → 钉钉 webhook</span></h3>
+      <h3>🔔 分账告警 <span class="muted">· 不可按资源标签分账的用量 → 钉钉 webhook</span></h3>
       <span class="chev" id="alertToggle">展开 ▾</span>
     </div>
     <div id="alertWrap" style="display:none">
@@ -1574,7 +2240,8 @@ tbody tr.subrow td:first-child{padding-left:26px}
         <span id="alertSave" style="font-size:13px"></span>
       </div>
       <div class="muted" style="margin-top:12px;line-height:1.8">
-        <b>规则:</b>只有 <b>application inference profile</b> 支持成本分配标签;窗口内若出现<b>直连模型ID / 系统跨区 profile</b>(us./global. 前缀)的用量即告警(无法分账)。
+        <b>规则:</b>窗口内若出现<b>直连模型ID / 系统跨区 profile</b>(us./global. 前缀)的用量即告警 —— 这类用量不支持<b>资源</b>成本分配标签(只有 <b>application inference profile</b> 支持)。
+        <b>例外:</b>若看板检测到已有打上 <code>map-migrated</code> 标签的 IAM principal(见「🔑 IAM Principal 打标」面板),说明可走 MAP 推荐的 <b>IAM principal 打标</b>分账,此时<b>降级为巡检消息不告警</b>,避免对已合规用量反复误报。
         EventBridge 定时扫描(默认每 6 小时,同时刷新快照);<b>推送按所选窗口节流</b>——同一窗口只推一条,选 12/24h 不会重复轰炸;忽略清单内的模型不参与告警。
         机器人安全设置建议「加签」,若用「自定义关键词」需包含 <b>Bedrock</b>。
         配置存于 Secrets Manager <b>bedrock-dashboard/alerts</b>。
@@ -1661,7 +2328,7 @@ function renderMain(){
     <thead><tr><th>模型</th><th>类型</th><th>输入</th><th>输出</th><th>缓存读</th><th>缓存写</th><th>估算成本</th></tr></thead>
     <tbody>${d.rows.map(x=>`<tr data-tip="${x.arn||x.id}">
       <td>${x.model}</td>
-      <td style="text-align:left"><span class="pill ${x.taggable?'ok':'warn'}" title="${x.taggable?(x.arn||x.id):(x.endpoint==='mantle'?'Responses API(mantle)端点:不支持成本分配标签,且无缓存 token 指标':'不可按标签分账')}">${x.kind||''}</span></td>
+      <td style="text-align:left"><span class="pill ${x.taggable?'ok':'warn'}" title="${x.taggable?(x.arn||x.id):(x.endpoint==='mantle'?'Responses API(mantle)端点:不支持成本分配标签,且无缓存 token 指标':'不可按资源标签分账;但若调用方 IAM Role/User 已打 map-migrated 标签,这部分用量仍可分账 —— 见「IAM Principal 打标」面板')}">${x.kind||''}</span></td>
       <td>${tok(x.in)}</td><td>${tok(x.out)}</td>
       <td>${x.endpoint==='mantle'?'<span class="muted" title="mantle 端点无缓存 token 指标">—</span>':tok(x.cache_read)}</td>
       <td>${x.endpoint==='mantle'?'<span class="muted" title="mantle 端点无缓存 token 指标">—</span>':tok(x.cache_write)}</td>
@@ -1758,6 +2425,204 @@ async function loadCe(){
     if(d.note){html+=`<div class="muted" style="margin-top:8px">⚠️ ${d.note}</div>`;}
     document.getElementById('ceTable').innerHTML=html;
   }catch(e){m.textContent='';document.getElementById('ceTable').innerHTML=`<div class="err">查询失败: ${e.message}</div>`;}
+}
+let prLoaded=false;
+function togglePrincipals(){
+  const w=document.getElementById('prWrap'),open=w.style.display==='none';
+  w.style.display=open?'block':'none';
+  document.getElementById('prToggle').textContent=open?'收起 ▴':'展开 ▾';
+  if(open&&!prLoaded){prLoaded=true;loadPrincipals(0);}
+  // 面板收起时停掉轮询,别在后台空转
+  if(!open)prStopPoll();
+}
+const PR_STATUS={tagged:{cls:'ok',txt:'✓ 已打标'},mistagged:{cls:'bad',txt:'⚠️ 无效打标'},
+  untagged:{cls:'warn',txt:'✗ 未打标'}};
+const PR_FILTER_TXT={all:'全部',tagged:'已打标',mistagged:'无效打标',untagged:'未打标'};
+// 筛选/翻页/切账号只重渲染已取回的数据,不重新扫描 IAM
+let PR_DATA=null,PR_FILTER='all',PR_SIZE=10,PR_PAGE={},PR_ACCT=0;
+function prSetFilter(f){
+  PR_FILTER=f;PR_PAGE={};   // 换筛选条件后页码归零,否则可能停在空页
+  document.querySelectorAll('#prSeg button').forEach(b=>b.classList.toggle('on',b.dataset.f===f));
+  prRender();
+}
+function prSetSize(v){PR_SIZE=parseInt(v,10)||0;PR_PAGE={};prRender();}
+function prSetAcct(v){PR_ACCT=parseInt(v,10)||0;PR_PAGE={};prRender();}
+// 账号下拉:单账号时没必要露出选择器;选项上带未打标数,一眼看出哪个账号要处理
+function prAcctOptions(d){
+  const accts=d.accounts||[],sel=document.getElementById('prAcct');
+  if(PR_ACCT>=accts.length)PR_ACCT=0;
+  sel.innerHTML=accts.map((a,i)=>{
+    const n=(a.rows||[]).filter(r=>r.status!=='tagged').length;
+    const tail=a.error?' — 权限不足':(n?` — ${n} 个待处理`:' — 全部已打标');
+    return `<option value="${i}">${esc(a.label||a.account||('账号 '+(i+1)))}${tail}</option>`;
+  }).join('');
+  sel.value=String(PR_ACCT);
+  document.getElementById('prAcctWrap').style.display=accts.length>1?'inline-flex':'none';
+}
+// 全量重扫走后台异步: 同步请求经 CloudFront 只有 60s,大账号注定扫不全。
+// 触发后轮询 job 状态,完成再拉快照。
+let PR_POLL=null;
+function prBtn(disabled,txt){
+  const b=document.getElementById('prScanBtn');
+  if(!b)return;
+  b.disabled=!!disabled;
+  b.textContent=txt||'⚡ 全量重扫(后台)';
+}
+function prStopPoll(){if(PR_POLL){clearInterval(PR_POLL);PR_POLL=null;}}
+async function scanPrincipals(){
+  const m=document.getElementById('prMeta');
+  prBtn(true,'⏳ 扫描中…');
+  m.textContent='正在启动后台全量扫描…';
+  try{
+    const r=await getJSON('?action=scan_principals');
+    if(r.error){throw new Error(r.error);}
+    m.textContent=r.queued?'⏳ 后台全量扫描已启动(通常 1–4 分钟),完成后自动刷新…'
+                          :'⏳ 已有后台扫描在进行中,等待其完成…';
+    prPoll();
+  }catch(e){prBtn(false);m.textContent='';
+    document.getElementById('prTable').innerHTML=`<div class="err">启动后台扫描失败: ${esc(e.message)}</div>`;}
+}
+function prPoll(){
+  prStopPoll();
+  const t0=Date.now();
+  PR_POLL=setInterval(async()=>{
+    // 兜底: 前端也设上限,免得后台任务状态卡住导致无限轮询
+    if(Date.now()-t0>12*60*1000){prStopPoll();prBtn(false);
+      document.getElementById('prMeta').textContent='⚠️ 等待超时,请稍后点「🔄 刷新(快照)」查看结果';return;}
+    let j;
+    try{ j=(await getJSON('?format=principals_job')).job||{}; }catch(e){ return; }  // 网络抖动继续等
+    const secs=Math.round((Date.now()-t0)/1000);
+    if(j.state==='running'){
+      document.getElementById('prMeta').textContent=`⏳ 后台全量扫描中… 已等待 ${secs}s(通常 1–4 分钟)`;
+      return;
+    }
+    prStopPoll();prBtn(false);
+    if(j.state==='done'){
+      // cache_written=false 说明这次结果比现有快照更残缺,被保护逻辑拒绝写入
+      await loadPrincipals(0);
+      if(j.cache_written===false){
+        document.getElementById('prMeta').textContent+=' · ⚠️ 本次扫描未扫全,已保留原有更完整的快照';
+      }
+    }else if(j.state==='failed'){
+      document.getElementById('prMeta').textContent='';
+      document.getElementById('prTable').innerHTML=
+        `<div class="err">后台扫描失败: ${esc(j.error||'未知原因')}</div>`;
+    }else{
+      document.getElementById('prMeta').textContent='⚠️ 未取到扫描状态,请点「🔄 刷新(快照)」';
+    }
+  },4000);
+}function prGo(acct,p){PR_PAGE[acct]=p;prRender();}
+function prFiltered(a){
+  const rows=a.rows||[];
+  return PR_FILTER==='all'?rows:rows.filter(r=>r.status===PR_FILTER);
+}
+// 修复命令: role 用 tag-role, user 用 tag-user;期望值未设置时留占位符提示去填 MPE ID
+function prFixCmd(r,exp){
+  const val=exp||'mig<你的 MPE ID>';
+  return `aws iam tag-${r.type} --${r.type}-name ${r.name} --tags "Key=map-migrated,Value=${val}"`;
+}
+function prCopy(btn){
+  const cmd=btn.getAttribute('data-cmd');
+  const old=btn.textContent;
+  // clipboard 在非安全上下文/无权限时会 reject,别让它变成未捕获异常
+  Promise.resolve(navigator.clipboard&&navigator.clipboard.writeText(cmd))
+    .then(()=>{btn.textContent='✓ 已复制';})
+    .catch(()=>{btn.textContent='⚠️ 请手动复制';});
+  setTimeout(()=>btn.textContent=old,1500);
+}
+function prRows(a,exp,rows){
+  if(a.error)return `<tr><td colspan="6"><span class="err">${esc(a.error)}</span></td></tr>`;
+  if(!a.rows||!a.rows.length)return '<tr><td colspan="6" style="text-align:center;color:#8b94b8">未发现有 Bedrock 调用权限的 Role/User</td></tr>';
+  if(!rows.length)return `<tr><td colspan="6" style="text-align:center;color:#8b94b8">该账号没有符合「${PR_FILTER_TXT[PR_FILTER]}」的 principal</td></tr>`;
+  return rows.map(r=>{
+    const st=PR_STATUS[r.status]||{cls:'',txt:r.status};
+    // 修复命令单独占一整行:塞在名称列里会与其他列争宽度,把表头挤成竖排
+    const cmd=prFixCmd(r,exp);
+    const fix=r.status==='tagged'?'':`<tr class="prcmd"><td colspan="6"><div class="prcmdbox">
+      <code>${esc(cmd)}</code>
+      <button class="preset" style="padding:2px 8px;font-size:11px" data-cmd="${esc(cmd)}" onclick="prCopy(this)">📋 复制</button>
+      </div></td></tr>`;
+    return `<tr data-tip="${esc(r.arn||r.name)}">
+      <td style="text-align:left;white-space:nowrap">${r.type==='role'?'🎭 Role':'👤 User'}</td>
+      <td style="text-align:left"><span class="prname" title="${esc(r.arn||'')}">${esc(r.name)}</span>${
+        r.broad?' <span class="pill warn" title="仅因策略含 Action:&quot;*&quot; 等宽泛授权而入选,并非显式授予 Bedrock 权限,请人工确认是否真在调用">宽泛授权</span>':''}</td>
+      <td style="text-align:left" class="muted prvia" title="${esc((r.via||[]).join(', '))}">${esc((r.via||[]).join(', ')||'—')}</td>
+      <td style="white-space:nowrap">${r.lastUsed?esc(r.lastUsed):'<span class="muted" title="IAM 仅记录角色的最后使用时间,用户无此字段;从未使用过也为空">—</span>'}</td>
+      <td style="text-align:left"><span class="pill ${st.cls}" title="${esc(r.reason||'')}">${st.txt}</span>${
+        r.reason?`<div class="muted" style="margin-top:4px">${esc(r.reason)}</div>`:''}</td>
+      <td style="text-align:left">${r.tagValue?`<code>${escTag(r.tagValue)}</code>`:'<span class="muted">—</span>'}</td></tr>${fix}`;
+  }).join('');
+}
+async function loadPrincipals(live){
+  const m=document.getElementById('prMeta');
+  m.textContent=live?'同步扫描 IAM(受网关超时限制)…':'读取快照…';
+  document.getElementById('prCards').innerHTML='';
+  document.getElementById('prBar').style.display='none';
+  document.getElementById('prTable').innerHTML='<div class="loading">⏳ 正在读取 IAM 打标快照…</div>';
+  try{
+    const d=await getJSON(`?format=principals${live?'':'&cached=1'}`);
+    PR_DATA=d;PR_PAGE={};
+    const t=d.totals||{},exp=d.expectedTag||'';
+    m.textContent=(d.cached_at?`📸 快照 · 生成于 ${d.cached_at} UTC${d.partial?' · ⚠️ 未扫全':''}`:'⚡ 实时扫描')
+      +` · ${(d.accounts||[]).length} 个账号(卡片为全账号合计)`
+      +(exp?` · 期望标签值 ${exp}`:' · 未设期望值(任何非空值都算已打标)');
+    document.getElementById('prCards').innerHTML=`
+      <div class="card hl"><div class="k">Bedrock principal 数</div><div class="v">${fmt(t.candidates||0)}</div></div>
+      <div class="card"><div class="k">已打标${exp?'(值匹配)':''}</div><div class="v" style="color:#34d399">${fmt(t.tagged||0)}</div></div>
+      <div class="card"><div class="k">⚠️ 无效打标</div><div class="v" style="color:${(t.mistagged||0)>0?'#fb7185':'inherit'}">${fmt(t.mistagged||0)}</div></div>
+      <div class="card"><div class="k">未打标</div><div class="v" style="color:${(t.untagged||0)>0?'#fbbf24':'inherit'}">${fmt(t.untagged||0)}</div></div>
+      <div class="card"><div class="k">打标率</div><div class="v">${t.taggedPct||0}%</div></div>`;
+    document.getElementById('prBar').style.display=(d.accounts||[]).length?'flex':'none';
+    prAcctOptions(d);
+    prRender();
+    // 若此刻正有后台扫描在跑(可能是别人触发或定时任务),自动接管轮询,免得看着旧快照发懵
+    if(!PR_POLL){
+      try{
+        const j=(await getJSON('?format=principals_job')).job||{};
+        if(j.state==='running'){prBtn(true,'⏳ 扫描中…');
+          m.textContent+=' · ⏳ 后台扫描进行中';prPoll();}
+      }catch(e){}
+    }
+  }catch(e){m.textContent='';PR_DATA=null;
+    document.getElementById('prTable').innerHTML=`<div class="err">查询失败: ${esc(e.message)}</div>`;}
+}
+function prRender(){
+  const d=PR_DATA;if(!d)return;
+  const exp=d.expectedTag||'';
+  const accts=d.accounts||[];
+  if(!accts.length){
+    document.getElementById('prTable').innerHTML='<div class="loading">未注册任何账号</div>';
+    return;
+  }
+  // 一次只渲染选中的那个账号:多账号纵向堆叠会把页面拉得很长,找不到重点
+  const ai=Math.min(PR_ACCT,accts.length-1);
+  const a=accts[ai];
+  const all=prFiltered(a);
+  const size=PR_SIZE>0?PR_SIZE:(all.length||1);
+  const pages=Math.max(1,Math.ceil(all.length/size));
+  const pg=Math.min(PR_PAGE[ai]||0,pages-1);
+  const rows=all.slice(pg*size,pg*size+size);
+  const scanned=a.error?'':`已扫 ${fmt(a.roles_scanned||0)} 角色 / ${fmt(a.users_scanned||0)} 用户 · 命中 ${fmt(a.candidates||0)}`;
+  const ne=a.notEvaluated||0;
+  const tip=ne?`有 ${ne} 个 principal 未评估(时间到或限流/权限导致读取失败),其打标状态未知`:'达上限或时间到,未覆盖全部 principal';
+  const shown=PR_FILTER==='all'?'':` · 筛选后 ${fmt(all.length)}`;
+  let html=`<div class="muted" style="margin:4px 0 6px">🏢 <b>${esc(a.label||a.account)}</b>
+    <span style="margin-left:8px">${scanned}${shown}</span>${a.truncated?` <span class="pill warn" title="${esc(tip)}">未扫全${ne?' · '+fmt(ne)+' 个未评估':''}</span>`:''}</div>`;
+  html+=`<table><thead><tr><th style="text-align:left">类型</th><th style="text-align:left">名称</th>
+    <th style="text-align:left">权限来源</th><th>最后使用</th><th style="text-align:left">打标状态</th>
+    <th style="text-align:left">标签值</th></tr></thead><tbody>${prRows(a,exp,rows)}</tbody></table>`;
+  if(pages>1){
+    const lo=pg*size+1,hi=Math.min(all.length,pg*size+size);
+    html+=`<div class="prpager"><span>${fmt(lo)}–${fmt(hi)} / ${fmt(all.length)}</span>
+      <button class="preset" ${pg===0?'disabled':''} onclick="prGo(${ai},${pg-1})">‹ 上一页</button>
+      <span>第 ${pg+1} / ${pages} 页</span>
+      <button class="preset" ${pg>=pages-1?'disabled':''} onclick="prGo(${ai},${pg+1})">下一页 ›</button></div>`;
+  }
+  if(a.note&&!a.error)html+=`<div class="muted" style="margin-top:6px">${esc(a.note)}</div>`;
+  if(d.note)html+=`<div class="muted" style="margin-top:12px;color:#fde68a">⚠️ ${esc(d.note)}</div>`;
+  document.getElementById('prTable').innerHTML=html;
+  // 筛选/分页对当前账号无数据时没有意义(如该账号权限不足只有一行 error)
+  document.getElementById('prFilterWrap').style.display=(a.rows||[]).length?'inline-flex':'none';
 }
 function toggleErr(){
   if(!document.getElementById('errWrap'))return;
@@ -1939,7 +2804,7 @@ function genOnboard(){
   document.getElementById('aExt').value=ext;
   const central=window._central||'';
   const trust='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"'+central+'"},"Action":"sts:AssumeRole","Condition":{"StringEquals":{"sts:ExternalId":"'+ext+'"}}}]}';
-  const perm='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["cloudwatch:GetMetricData","cloudwatch:ListMetrics","bedrock:ListInferenceProfiles","bedrock:GetInferenceProfile","bedrock-mantle:ListProjects","bedrock-mantle:ListTagsForResource","ce:GetCostAndUsage"],"Resource":"*"}]}';
+  const perm='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["cloudwatch:GetMetricData","cloudwatch:ListMetrics","bedrock:ListInferenceProfiles","bedrock:GetInferenceProfile","bedrock-mantle:ListProjects","bedrock-mantle:ListTagsForResource","ce:GetCostAndUsage","iam:ListRoles","iam:ListUsers","iam:GetRole","iam:GetUser","iam:ListRoleTags","iam:ListUserTags","iam:ListAttachedRolePolicies","iam:ListRolePolicies","iam:GetRolePolicy","iam:ListAttachedUserPolicies","iam:ListUserPolicies","iam:GetUserPolicy","iam:ListGroupsForUser","iam:ListAttachedGroupPolicies","iam:ListGroupPolicies","iam:GetGroupPolicy","iam:GetPolicy","iam:GetPolicyVersion"],"Resource":"*"}]}';
   const rn='BedrockUsageReader-'+Math.random().toString(36).slice(2,6);
   const cmd='aws iam create-role --role-name '+rn+' \\\n'
     +"  --assume-role-policy-document '"+trust+"' \\\n"
