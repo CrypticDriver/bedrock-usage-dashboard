@@ -80,6 +80,8 @@ DASH_PASS='你的登录密码' ./deploy.sh
 
 **更新**:`git pull && ./deploy.sh` —— 密码沿用、栈增量更新,单价/账号/告警配置存于 Secrets **不会丢**。版本看页脚,变更见 [CHANGELOG.md](CHANGELOG.md),可 `git checkout v1.1.0` 锁版本。
 
+> ⬆️ **从任意旧版本可直接升级到最新版,无需逐版本升级** —— 合并版步骤见 [docs/UPGRADE.md](docs/UPGRADE.md)。
+
 > ⬆️ **升到 1.8.0(IAM Principal 打标面板)有一处需手工介入**:成员账号的 `BedrockUsageReader` 角色需补 IAM **只读**权限,否则该账号在新面板显示"权限不足"(用量与账单统计不受影响)。不阻塞升级 —— 详见 [docs/UPGRADE-1.8.0.md](docs/UPGRADE-1.8.0.md)。
 
 > ⬆️ **升到 1.7.0(GPT-5.6 纳管)有两处需手工介入**:成员账号补 `bedrock-mantle` 只读权限、单价表补 GPT-5.6 三条(单价存于 Secrets 会整表覆盖代码内置值,**新装同样需要**,否则成本列显示 UNKNOWN)。不做仅功能降级、不阻塞升级 —— 详见 [docs/UPGRADE-1.7.0.md](docs/UPGRADE-1.7.0.md)。
