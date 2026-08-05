@@ -1,4 +1,4 @@
-# 升级指南 — 任意旧版本直升最新版(v1.9.0)
+# 升级指南 — 任意旧版本直升最新版(v1.10.0)
 
 **支持跳版直升,无需逐版本升级。** 所有基础设施由 CloudFormation 声明式管理,没有逐版本迁移脚本;`./deploy.sh` 会把栈一次性收敛到当前模板。密码沿用、单价/账号/告警配置存于 Secrets **不会丢**,页面设置(map-migrated 标签值等)存于 S3 同样保留。
 
@@ -96,11 +96,12 @@ aws iam put-role-policy --role-name "$ROLE" \
 | < 1.5.0 | 新版打开页面/切换快捷范围会**自动触发 CE 查询**(每账号每次 $0.02 API 费用),此前是手动按钮触发 |
 | < 1.3.2 | 中心角色 AssumeRole 已放宽为 `BedrockUsageReader*`(支持自定义后缀角色),随 ① 自动生效,无需操作 |
 | ≤ 1.7.0 | 分账告警行为变化:检测到已打标的 IAM principal 时,不可资源分账用量**降级为巡检消息**不再告警(金额仍列出) |
-| ≤ 1.8.0 | 新增 **GPT-5.6/mantle 专项检查**(默认 15 分钟一次,发现未打标 API key user 调用即点名告警);不想要:`MANTLE_RATE=disabled ./deploy.sh`。行为详见 [UPGRADE-1.9.0.md](UPGRADE-1.9.0.md) |
+| ≤ 1.8.0 | 新增 **GPT-5.6/mantle 专项检查**(默认 15 分钟一次);不想要:`MANTLE_RATE=disabled ./deploy.sh` |
+| ≤ 1.9.0 | ⚠️ **1.9.0 的专项检查有漏报漏洞**(只盯 API key user,漏 SigV4 调用者),1.10.0 已修,建议尽快升级;同时默认创建 **mantle 审计 trail**(告警点名真实调用者,$0.10/10万次调用),不想要:`MANTLE_AUDIT=false ./deploy.sh`。详见 [UPGRADE-1.10.0.md](UPGRADE-1.10.0.md) |
 
 ## 验证清单
 
-1. 页脚版本号 = **v1.9.0**
+1. 页脚版本号 = **v1.10.0**
 2. 用量表出现 `openai.gpt-5.6-*` 行(如有 GPT-5.6 用量),类型列 **Responses API (mantle)**,成本不为 `UNKNOWN`
 3. 「💰 真实账单」金额不再恒为 0(CE 服务名匹配已修复)
 4. 「🔑 IAM Principal 打标」面板可展开,各纳管账号不显示"权限不足"

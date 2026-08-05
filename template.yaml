@@ -22,6 +22,11 @@ Parameters:
     Type: String
     Default: rate(15 minutes)
     Description: GPT-5.6/mantle 无标签调用专项检查频率(轻量,近实时点名未打标的 API key user);置 disabled 关闭
+  MantleAudit:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: 是否创建 mantle 调用审计 trail(CloudTrail 数据事件,仅记 GPT-5.6/mantle 调用)。开启后专项告警可精确点名真实调用者;费用约 $0.10/10万次调用 + 少量 S3
   EnableOpsPanels:
     Type: String
     Default: "false"
@@ -31,6 +36,7 @@ Parameters:
 Conditions:
   # MantleCheckRate=disabled 时不建专项检查 rule(定时告警 AlertSchedule 不受影响)
   MantleCheckOn: !Not [!Equals [!Ref MantleCheckRate, disabled]]
+  MantleAuditOn: !Equals [!Ref MantleAudit, "true"]
 
 Resources:
 
@@ -69,6 +75,71 @@ Resources:
           - Id: expire-old-cache
             Status: Enabled
             ExpirationInDays: 7
+
+  MantleAuditBucket:
+    # mantle 调用审计日志(CloudTrail 数据事件)。独立于 CacheBucket:
+    # 生命周期不同(审计留 30 天 vs 缓存 7 天),且 CloudTrail 需要专门的桶策略
+    Type: AWS::S3::Bucket
+    Condition: MantleAuditOn
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-mantle-audit-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-audit
+            Status: Enabled
+            ExpirationInDays: 30
+
+  MantleAuditBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: MantleAuditOn
+    Properties:
+      Bucket: !Ref MantleAuditBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AclCheck
+            Effect: Allow
+            Principal: {Service: cloudtrail.amazonaws.com}
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt MantleAuditBucket.Arn
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub "arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${AWS::StackName}-mantle-audit"
+          - Sid: Write
+            Effect: Allow
+            Principal: {Service: cloudtrail.amazonaws.com}
+            Action: s3:PutObject
+            Resource: !Sub "${MantleAuditBucket.Arn}/AWSLogs/${AWS::AccountId}/*"
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                aws:SourceArn: !Sub "arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${AWS::StackName}-mantle-audit"
+
+  MantleAuditTrail:
+    # 只记 mantle 数据事件(CreateInference 等),不记管理事件 —— 事件量小、费用可忽略。
+    # 有它,专项告警能精确点名"这笔 GPT-5.6 用量是谁调的";没它退回能力嫌疑名单
+    Type: AWS::CloudTrail::Trail
+    Condition: MantleAuditOn
+    DependsOn: MantleAuditBucketPolicy
+    Properties:
+      TrailName: !Sub "${AWS::StackName}-mantle-audit"
+      S3BucketName: !Ref MantleAuditBucket
+      IsLogging: true
+      IsMultiRegionTrail: true
+      # 多区域 trail 必须带 true;实际不会记任何管理事件(selector 只选了 Data),不影响费用
+      IncludeGlobalServiceEvents: true
+      AdvancedEventSelectors:
+        - Name: mantle-data-events
+          FieldSelectors:
+            - Field: eventCategory
+              Equals: [Data]
+            - Field: resources.type
+              Equals: ["AWS::BedrockMantle::Project"]
 
   DashboardRole:
     Type: AWS::IAM::Role
@@ -141,6 +212,17 @@ Resources:
                   - s3:GetObject
                   - s3:PutObject
                 Resource: !Sub "${CacheBucket.Arn}/*"
+              - !If
+                - MantleAuditOn
+                - Sid: MantleAuditRead
+                  Effect: Allow
+                  Action:
+                    - s3:GetObject
+                    - s3:ListBucket
+                  Resource:
+                    - !GetAtt MantleAuditBucket.Arn
+                    - !Sub "${MantleAuditBucket.Arn}/*"
+                - !Ref AWS::NoValue
               - Sid: SelfInvoke
                 Effect: Allow
                 Action: lambda:InvokeFunction
@@ -183,6 +265,7 @@ Resources:
           ALERTS_SECRET: !Ref AlertsSecret
           ENABLE_OPS_PANELS: !Ref EnableOpsPanels
           CACHE_BUCKET: !Ref CacheBucket
+          MANTLE_AUDIT_BUCKET: !If [MantleAuditOn, !Ref MantleAuditBucket, ""]
 
   FunctionUrl:
     Type: AWS::Lambda::Url

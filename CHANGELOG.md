@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.10.0 (2026-08-05)
+
+**新增**
+- **mantle 调用审计与精确归因**:栈内新增可选 CloudTrail 审计 trail(`MantleAudit=true` 默认开启,`MANTLE_AUDIT=false ./deploy.sh` 关闭),只记录 mantle 数据事件(`AWS::BedrockMantle::Project` / `CreateInference`),费用约 $0.10/10 万次调用 + 少量 S3(30 天生命周期)。开启后专项告警从"嫌疑名单"升级为**点名真实调用者**:每个未打标调用者的身份(Role/User)、调用次数、所调模型、是否 API key 调用,附打标修复命令
+- 审计事件同时覆盖 **SigV4 与 API key(bearer)** 两种调用方式,实测归因均精确到 principal;AssumedRole 归因到背后的 role(session 名是噪音,打标也在 role 上)
+- token 用量仍来自 CloudWatch(审计事件不含逐笔 token 数),消息给模型总量 + 各调用者次数作分摊参考
+
+**修复(重要)**
+- **v1.9.0 假阴性漏洞**:专项检查此前把"API key user 全部已打标"当静默条件 —— 但 mantle 同样接受 SigV4 调用,未打标的 Role/User 走 SigV4 时会被误判为"没问题"而漏报。现在:无审计时,有用量且存在**任何**未打标的 Bedrock 身份(API key user 或 SigV4 Role/User)即告警,消息分「持有 API key(高嫌疑)」与「具备权限(可走 SigV4)」两段如实呈现;有审计时按真实调用者判定,全部已打标才静默(此时结论可靠)
+
+**行为说明**
+- 审计事件交付延迟实测 5–15 分钟:指标已有用量、审计暂无事件时,本轮按能力名单报,事件到齐后自然转为点名(指纹含归因模式,升档立即再报不受去重压制)
+- 无审计告警的尾部附一句开启引导;`iam:ListServiceSpecificCredentials` 等权限要求同 v1.9.0
+
+**升级**:`git pull && ./deploy.sh`(默认自动创建审计 trail);不想要审计 `MANTLE_AUDIT=false ./deploy.sh`。详见 [docs/UPGRADE-1.10.0.md](docs/UPGRADE-1.10.0.md)
+
 ## 1.9.0 (2026-08-05)
 
 **新增**

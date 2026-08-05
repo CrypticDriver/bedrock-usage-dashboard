@@ -21,6 +21,7 @@ DASH_USER="${DASH_USER:-admin}"
 DASH_PASS="${DASH_PASS:-}"
 ALERT_RATE="${ALERT_RATE:-rate(6 hours)}"
 MANTLE_RATE="${MANTLE_RATE:-rate(15 minutes)}"   # GPT-5.6/mantle 专项检查频率; MANTLE_RATE=disabled 关闭
+MANTLE_AUDIT="${MANTLE_AUDIT:-true}"             # mantle 调用审计 trail(精确点名调用者); MANTLE_AUDIT=false 关闭
 OPS_PANELS="${OPS_PANELS:-false}"
 
 command -v aws >/dev/null || { echo "❌ 需要 aws cli"; exit 1; }
@@ -59,7 +60,7 @@ aws cloudformation package \
   --output-template-file "$TMP/packaged.yaml" --region "$REGION" >/dev/null
 
 echo ">> 部署栈(首次约 5-8 分钟, CloudFront 分发较慢)…"
-PARAMS=("AlertScheduleRate=$ALERT_RATE" "MantleCheckRate=$MANTLE_RATE" "EnableOpsPanels=$OPS_PANELS")
+PARAMS=("AlertScheduleRate=$ALERT_RATE" "MantleCheckRate=$MANTLE_RATE" "MantleAudit=$MANTLE_AUDIT" "EnableOpsPanels=$OPS_PANELS")
 if [ -n "$DASH_PASS" ]; then
   PARAMS+=("DashUser=$DASH_USER" "DashPass=$DASH_PASS")
 fi

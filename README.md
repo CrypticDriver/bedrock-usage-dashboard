@@ -14,7 +14,7 @@
 | 🔑 IAM Principal 打标 | 扫出**有 Bedrock 调用权限的 IAM Role / User**,显示各自 `map-migrated` 打标状态(已打标 / 无效打标 / 未打标)与权限来源,未打标行直接给出可复制的 `aws iam tag-role` 修复命令 —— 对应 MAP 推荐的 **IAM principal tagging**(无需建 inference profile、无需改代码);支持账号下拉、按打标状态筛选与分页 |
 | 🏷️ 分账视角 | 类型列区分**模型 ID / 系统跨区 profile / 应用推理 profile**(绿 = 可按资源标签分账);悬停任意行即显完整 ARN / ModelId |
 | 🔔 分账告警 | 发现不可按资源标签分账的用量 → 推送**钉钉 webhook**(可加签);已用 IAM principal 打标时自动降级为巡检不误报;EventBridge 定时检查,页面可视化配置;支持忽略清单 + 按窗口节流防重复轰炸 |
-| ⚡ GPT-5.6 专项告警 | 高频轻量检查(默认 15 分钟):发现 mantle 端点用量且存在**未打标的 Bedrock API key user** 时,近实时**点名到 user** 并附一行打标修复命令;同一问题 6 小时去重,新嫌疑立即再报 |
+| ⚡ GPT-5.6 专项告警 | 高频轻量检查(默认 15 分钟)+ 可选**审计 trail**(默认开,$0.10/10万次调用):发现 mantle 无标签用量时**精确点名真实调用者**(身份/次数/模型/是否 API key)并附打标修复命令;未开审计退回能力嫌疑名单;同一问题 6 小时去重,新情况立即再报 |
 | 📸 快照秒开 | 定时任务把 7 天 global 数据与 IAM principal 打标状态快照到 S3,页面打开约 0.3s 出数;点「查询估算」才实时扫描 |
 | 🌍 区域 & global | 单区域查询,或跨全部已启用区域并发聚合;默认查近 7 天 |
 | 🏢 多账号 / 跨 Org | AssumeRole + ExternalId 纳管其他账号,页面一键生成接入命令,**不要求同一 Organization** |
