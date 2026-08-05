@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.9.0 (2026-08-05)
+
+**新增**
+- **GPT-5.6/mantle 无标签调用专项检查(近实时)**:独立 EventBridge 定时(默认 `rate(15 minutes)`,可 `MANTLE_RATE=disabled ./deploy.sh` 关闭)轻量扫描近 30 分钟 mantle 端点用量;发现用量且账号内存在**未打标的 Bedrock API key user** 时,钉钉**直接点名**该 user 并附一行 `aws iam tag-user` 修复命令。从"有 $X 无标签用量"升级为"是谁在花、怎么修" —— mantle API key 调用不产生 CloudTrail 管理事件、user 也无 lastUsed 痕迹,此前完全无从归因
+- **归因原理**:mantle 调用要么走 API key(挂在 IAM user 上的 `bedrock.amazonaws.com` service-specific credential,账号内可枚举、通常个位数),要么走 SigV4(principals 快照已覆盖)。API key 场景嫌疑集足够小,可直接全部点名 —— 修复动作(打标)按 principal 执行,不需要逐笔归因
+- **「🔑 IAM Principal 打标」面板标注 API key**:持有 Active Bedrock API key 的 user 显示 `🔑 API key` 徽标(悬停有解释);principals 快照(`cache/principals.json`)的 user 行新增 `bedrockApiKey` 字段
+- IAM 新增 1 个只读动作 `iam:ListServiceSpecificCredentials`,老规矩三处同步(`template.yaml` / `onboard-account.yaml` / 页面 🎲 生成命令)
+
+**专项检查行为细节(设计取舍)**
+- **发送前逐个实时复核**嫌疑 user 的标签:快照最长滞后一个定时周期,刚打完标的人不该继续被点名;复核失败沿用快照结论(宁可多报不漏报)
+- **指纹去重防轰炸**:同一(模型集+嫌疑人集)指纹 6 小时内只推一次;指纹变化(新模型/新嫌疑人出现)立即再报。与主告警(`window_hours` 对齐节流)互不占槽,状态分开存(`cache/mantle-alert-state.json`)
+- **无法确认≠没问题**:principals 快照缺失时实时补扫中心账号 user 兜底;补扫也失败时照常告警但明确标注"无法确认调用方打标状态",不静默吞掉
+- **静默条件**:窗口内无 mantle 用量,或嫌疑 user 全部已打标 —— 专项检查没有心跳消息(15 分钟一条心跳是骚扰,链路通断由主告警的心跳保证)
+- 回看窗口 30 分钟 > 检查间隔 15 分钟,留重叠防指标上报延迟漏报;重叠导致的重复观察由指纹去重兜底
+- 复用主告警的钉钉 webhook/加签/enabled 配置,无需单独配置
+
+**修复**
+- **主告警把 mantle 模型误标为「直连模型 ID」**:GPT-5.6 等 mantle 模型在告警消息里被按前缀规则归类为直连模型 ID,并被通用建议引导去"创建 application inference profile" —— 对 mantle 端点做不到(不支持资源标签)。现单独标注 **Responses API (mantle)**,并在含 mantle 违规时附加说明:只能用 IAM principal 打标,或按 Bedrock Project 归集
+
+**升级**:`git pull && ./deploy.sh` 即可;成员账号 reader 角色需补 `iam:ListServiceSpecificCredentials`(不补则该账号 user 的 API key 状态未知,不影响其他功能)。详见 [docs/UPGRADE-1.9.0.md](docs/UPGRADE-1.9.0.md)
+
 ## 1.8.0 (2026-08-03)
 
 **新增**
