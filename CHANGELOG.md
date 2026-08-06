@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.11.0 (2026-08-06)
+
+**合并为单一告警链路**:GPT-5.6/mantle 归因并入主分账告警,不再有独立的专项检查
+
+- 删除 v1.9.0-v1.10.2 的独立 mantle 专项检查(15 分钟 EventBridge rule、`run_mantle_check`、`cache/mantle-alert-state.json`、`MantleCheckRate` 参数)。此前主告警(6/12h)与专项(15min)会对同一笔 GPT-5.6 无标签用量各报一次
+- 主告警(`run_alert_check`)现在**一条消息覆盖 runtime 与 mantle 两端**:mantle 用量若有审计 trail,直接读 CloudTrail 数据事件在告警里**点名真实调用者**(身份/次数/模型/是否 API key + 打标修复命令);审计确认调用者全部已打标则从违规中剔除(合规不误报);未开审计或事件未交付则保留违规并标注"调用者待确认"
+- 净效果:**一笔用量只响一条铃**,时效随主告警的 `AlertScheduleRate`(默认 6h);审计归因是主告警内的一段,不再单独调度
+- 审计 trail(`MantleAudit=true`)保留,现由主告警消费;`iam:ListServiceSpecificCredentials` 等权限不变
+
+**升级**:`git pull && ./deploy.sh`。独立专项 rule 会被自动删除,无手工步骤;审计 trail 与桶保留。
+
 ## 1.10.2 (2026-08-06)
 
 **行为变更:一笔用量只响一条铃**

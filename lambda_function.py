@@ -43,9 +43,6 @@ ENABLE_OPS_PANELS = os.environ.get("ENABLE_OPS_PANELS", "").lower() in ("1", "tr
 CACHE_BUCKET = os.environ.get("CACHE_BUCKET", "")
 # mantle 审计桶(CloudTrail 数据事件,MantleAudit=false 时为空):有它才能精确点名调用者
 MANTLE_AUDIT_BUCKET = os.environ.get("MANTLE_AUDIT_BUCKET", "")
-# 专项检查是否启用:启用时 mantle 归专项报警(点名到人),主告警对 mantle 只展示不升级,
-# 一笔用量只响一条铃;关掉专项(MantleCheckRate=disabled)时主告警恢复对 mantle 兜底
-MANTLE_CHECK_ON = bool(os.environ.get("MANTLE_CHECK_ON", ""))
 CACHE_KEY = "cache/global-7d.json"
 CACHE_MAX_AGE_SEC = 8 * 3600  # 定时任务每6h刷一次,超8h视为过期
 try:
@@ -83,14 +80,8 @@ def read_snapshot_cache():
 
 
 ALERT_STATE_KEY = "cache/alert-state.json"
-MANTLE_STATE_KEY = "cache/mantle-alert-state.json"
 PRINCIPALS_KEY = "cache/principals.json"
 PRINCIPALS_JOB_KEY = "cache/principals-job.json"
-# mantle 专项检查:扫描回看窗口(指标上报有几分钟延迟,窗口须大于检查间隔留重叠,
-# 宁可重复看到同一笔用量 —— 有指纹去重兜底 —— 也不能留缝漏报)
-MANTLE_CHECK_LOOKBACK_MIN = 30
-# 同一指纹(模型集+嫌疑人集)的重复告警最短间隔;指纹变化(新模型/新嫌疑人)立即再报
-MANTLE_SUPPRESS_SEC = 6 * 3600
 # 后台扫描任务的最长存活时间:超过就认为那次 invoke 已经死了(Lambda 超时/被杀),
 # 允许重新触发,否则一次意外失败会把按钮永久锁死。
 PRINCIPALS_JOB_TTL_SEC = 15 * 60
@@ -500,20 +491,47 @@ def run_alert_check(cfg=None, force_send=False):
     ignore = cfg.get("ignore_list") or []
     bad = [r for r in raw_bad if not _is_ignored(r["id"], ignore)]
     ignored_count = len(raw_bad) - len(bad)
-    # 专项检查启用时,mantle 归它报警(15 分钟粒度、点名到人),主告警对同一笔用量
-    # 不再升级 —— 一笔用量只响一条铃。金额仍在消息里单独展示,全景成本视图不缺块
-    mantle_rows = []
-    if MANTLE_CHECK_ON:
-        mantle_rows = [r for r in bad if r.get("endpoint") == "mantle"]
-        bad = [r for r in bad if r.get("endpoint") != "mantle"]
-    mantle_cost = round(sum(r["cost"] for r in mantle_rows), 2)
+    # mantle 行单独走审计归因:有审计事件时点名真实调用者;调用者全部已打标则
+    # 从违规中剔除(确认合规);未打标/无法确认则保留违规并附点名明细
+    mantle_rows = [r for r in bad if r.get("endpoint") == "mantle"]
+    bad = [r for r in bad if r.get("endpoint") != "mantle"]
+    mantle_callers, mantle_bad_callers, mantle_note = [], [], ""
+    if mantle_rows and MANTLE_AUDIT_BUCKET:
+        try:
+            callers, nfiles = mantle_audit_callers(start, end)
+            print(f"[mantle_audit] {len(callers or {})} caller(s) from {nfiles} file(s)")
+            if callers:
+                mantle_callers = list(callers.items())
+                for arn, c in callers.items():
+                    if c["kind"] not in ("role", "user"):
+                        mantle_bad_callers.append({**c, "arn": arn, "status": "untaggable",
+                                                   "reason": "非 Role/User 身份"})
+                        continue
+                    st = _recheck_principal_tag("", c["kind"], c["name"])
+                    if (st or "unknown") != "tagged":
+                        mantle_bad_callers.append({**c, "arn": arn,
+                                                   "status": st or "unknown", "reason": ""})
+                if not mantle_bad_callers:
+                    # 审计确认调用者全部已打标 → 这部分用量合规,不算违规
+                    mantle_rows = []
+            else:
+                mantle_note = ("审计事件尚未交付(延迟 5-15 分钟),调用者待下窗口确认")
+        except Exception as e:
+            print(f"[mantle_audit] read FAILED: {e!r}")
+            mantle_note = "审计日志读取失败,调用者本窗口无法确认"
+    elif mantle_rows:
+        mantle_note = ("未开启审计 trail,无法确认调用者;`./deploy.sh` 保留默认 "
+                       "`MantleAudit=true` 可开启点名")
+    # mantle 违规与 runtime 违规合并计数计钱 —— 一条告警覆盖全部
+    bad = bad + mantle_rows
     total_bad = round(sum(r["cost"] for r in bad), 2)
     # MAP 新增的 IAM principal tagging(2026-06-08 起生效): 调用方 Role/User 打了 map-migrated
     # 就能分账,直连模型 ID 不再必然"无法分账"。检测到已打标 principal 就把告警降级为巡检,
     # 否则每个窗口都在为已经合规的用量误报。只读缓存,IAM 扫描慢/失败绝不影响告警链路。
+    # 例外:审计已点名的未打标 mantle 调用者是坐实的违规,不因"别处有人打标"而降级。
     iam_tagged, iam_known = tagged_principal_state()
     covered = iam_tagged > 0
-    alerting = bool(bad) and not covered
+    alerting = (bool(bad) and not covered) or bool(mantle_bad_callers)
     # 快照未扫全且计数为 0: 不能断言"没人打标",但也不能因此压掉告警(那会漏真问题)。
     # 照常告警,只在消息里标注该结论未确认,让人知道要去面板确认而不是照着结论行动。
     tag_unknown = bool(bad) and not covered and not iam_known
@@ -525,7 +543,10 @@ def run_alert_check(cfg=None, force_send=False):
     result = {"checked": True, "window_hours": hours, "region": cfg.get("region", "global"),
               "start": start.strftime("%Y-%m-%d %H:%M"), "end": end.strftime("%Y-%m-%d %H:%M"),
               "violations": bad, "violation_cost": total_bad,
-              "mantle_display_cost": mantle_cost, "mantle_deferred": len(mantle_rows),
+              "mantle_callers": [{"name": c["name"], "kind": c["kind"],
+                                  "status": c["status"], "count": c.get("count", 0)}
+                                 for c in mantle_bad_callers],
+              "mantle_note": mantle_note,
               "ignored_count": ignored_count, "throttled": throttled,
               "iam_principal_tagged": iam_tagged, "iam_tag_known": iam_known,
               "iam_tag_unknown": tag_unknown, "alerting": alerting,
@@ -588,6 +609,28 @@ def run_alert_check(cfg=None, force_send=False):
                 blocks.append("> ℹ️ 其中 **Responses API (mantle)** 模型(GPT-5.6 等)"
                               "**不支持方式②**(该端点无资源标签),只能用 ①，"
                               "或在 mantle 侧按 **Bedrock Project** 归集(看板用量表已按 project 拆分)。")
+            # 审计点名:mantle 用量的真实调用者(数据事件 userIdentity),坐实到人
+            if mantle_bad_callers:
+                exp = load_settings().get("map_tag_value", "") or "<你的MAP标签值>"
+                blocks.append(f"🔍 **GPT-5.6/mantle 调用者已由审计日志确认**"
+                              f"(窗口内共 {len(mantle_callers)} 个身份,"
+                              f"未打标 {len(mantle_bad_callers)} 个):")
+                citems = []
+                for c in sorted(mantle_bad_callers, key=lambda x: -x.get("count", 0))[:10]:
+                    icon = "👤" if c["kind"] == "user" else ("🎭" if c["kind"] == "role" else "⚠️")
+                    via = " · API key 调用" if c.get("bearer") else ""
+                    models = f" · {'/'.join(c['models'])}" if c.get("models") else ""
+                    if c["status"] == "untaggable":
+                        citems.append(f"- {icon} `{c['name']}` — **{c['count']} 次**{models}{via}"
+                                      f" — {c['reason']},无法打 IAM 标签,请改用可打标身份调用")
+                    else:
+                        citems.append(f"- {icon} `{c['name']}` — **{c['count']} 次**{models}{via}"
+                                      f" — **{c['status']}**\n  修复：`aws iam tag-{c['kind']} "
+                                      f"--{c['kind']}-name {c['name']} "
+                                      f"--tags \"Key=map-migrated,Value={exp}\"`")
+                blocks.append("\n".join(citems))
+            elif mantle_note:
+                blocks.append(f"> ℹ️ mantle 调用者归因:{mantle_note}")
             if tag_unknown:
                 blocks.append("> ℹ️ 注：最近一次 IAM 扫描**未覆盖全部 principal**，"
                               "「无人打标」这一判断**尚未确认**——可能已有 Role/User 打了标但没扫到。"
@@ -603,11 +646,6 @@ def run_alert_check(cfg=None, force_send=False):
         else:
             blocks.append("当前窗口内未发现无标签用量，全部调用均带标签可归属。"
                           if not force_send else "✅ 测试消息：当前窗口内未发现无标签用量。")
-        if mantle_rows:
-            # 仅展示,不计入违规:GPT-5.6/mantle 由专项检查按真实调用者报警,双链路只响一条铃
-            names = "、".join(r["model"] for r in mantle_rows[:5])
-            blocks.append(f"_ℹ️ 另有 GPT-5.6/mantle 用量 ≈ ${mantle_cost}（{names}），"
-                          "由专项检查按真实调用者监控与告警，不计入本条违规_")
         if ignored_count:
             blocks.append(f"_已按忽略清单跳过 {ignored_count} 个模型_")
         print(f"[dingtalk] sending: has_secret={bool(cfg.get('sign_secret'))}, "
@@ -635,91 +673,6 @@ def run_alert_check(cfg=None, force_send=False):
             print(f"[dingtalk] EXCEPTION {type(e).__name__}: {e}")
             traceback.print_exc()
     return result
-
-
-def _mantle_state_read():
-    if not CACHE_BUCKET:
-        return {}
-    try:
-        s3 = boto3.client("s3", region_name=LAMBDA_REGION)
-        return json.loads(s3.get_object(Bucket=CACHE_BUCKET, Key=MANTLE_STATE_KEY)["Body"].read())
-    except Exception:
-        return {}
-
-
-def _mantle_state_write(state):
-    if not CACHE_BUCKET:
-        return
-    try:
-        boto3.client("s3", region_name=LAMBDA_REGION).put_object(
-            Bucket=CACHE_BUCKET, Key=MANTLE_STATE_KEY,
-            Body=json.dumps(state).encode(), ContentType="application/json")
-    except Exception as e:
-        print(f"[mantle_check] state write failed: {e}")
-
-
-def mantle_usage_scan(region_cfg, minutes):
-    """近 N 分钟 mantle 端点用量,轻量扫描:每区域 list_metrics + 一次 get_metric_data。
-    分钟粒度(Period=60)贴近实时;跨中心+全部注册账号。
-    返回 {model_id: {"in": n, "out": n, "where": ["账号@区域", ...]}}。"""
-    try:
-        central_id = central_role_arn().split(":")[4]
-    except Exception:
-        central_id = ""
-    targets = [(None, central_id or "中心")]
-    for a in load_accounts():
-        if a["accountId"] != central_id:
-            targets.append((a["accountId"], a["accountId"]))
-    regions = regions_for(region_cfg)
-    end = dt.datetime.now(dt.UTC)
-    start = end - dt.timedelta(minutes=minutes)
-
-    def one(account, label, region):
-        sess = session_for(account)
-        cw = sess.client("cloudwatch", region_name=region, config=FAST)
-        models = []
-        for page in cw.get_paginator("list_metrics").paginate(
-                Namespace=MANTLE_NAMESPACE, MetricName="TotalInputTokens"):
-            for m in page["Metrics"]:
-                dims = {d["Name"]: d["Value"] for d in m["Dimensions"]}
-                if set(dims) == {"Model"}:
-                    models.append(dims["Model"])
-        if not models:
-            return {}
-        q, ids = [], {}
-        for i, mid in enumerate(models):
-            for j, name in enumerate(MANTLE_METRICS):
-                qid = f"m{i}_{j}"
-                ids[qid] = (mid, MANTLE_METRICS[name])
-                q.append({"Id": qid, "MetricStat": _metric_query(mid, name, 60, "mantle")})
-        got = {}
-        for page in cw.get_paginator("get_metric_data").paginate(
-                MetricDataQueries=q, StartTime=start, EndTime=end):
-            for r in page["MetricDataResults"]:
-                mid, field = ids[r["Id"]]
-                if r["Values"]:
-                    d = got.setdefault(mid, {"in": 0.0, "out": 0.0})
-                    d[field] += sum(r["Values"])
-        return {mid: {**v, "where": f"{label}@{region}"} for mid, v in got.items()
-                if v["in"] + v["out"] > 0}
-
-    usage = {}
-    with ThreadPoolExecutor(max_workers=16) as ex:
-        futs = {ex.submit(one, acct, label, r): (label, r)
-                for acct, label in targets for r in regions}
-        for f in as_completed(futs):
-            try:
-                res = f.result()
-            except Exception as e:
-                # 单点失败只损失该账号/区域的可见性,不拖垮整次检查;留痕便于排查
-                print(f"[mantle_check] scan {futs[f]} FAILED: {e!r}")
-                continue
-            for mid, v in res.items():
-                d = usage.setdefault(mid, {"in": 0.0, "out": 0.0, "where": []})
-                d["in"] += v["in"]
-                d["out"] += v["out"]
-                d["where"].append(v["where"])
-    return usage
 
 
 def _recheck_principal_tag(account, kind, name):
@@ -820,162 +773,6 @@ def mantle_audit_callers(start, end):
     if len(keys) > 200:
         print(f"[mantle_audit] WARNING: {len(keys)} files in window, only first 200 read")
     return callers, len(keys)
-
-
-def run_mantle_check(cfg=None, force_send=False):
-    """mantle(GPT-5.6/Responses API)无标签调用专项检查 —— 高频轻量版。
-
-    与 run_alert_check 的分工:后者按 window_hours 全面扫两端点、有心跳、按窗口节流。
-
-    只报"审计确认发生的违规",不报"存在违规的可能":
-    - 审计事件里出现**未打标身份的调用** → 点名告警(身份/次数/模型/修复命令);
-      调用者全部已打标 → 静默。
-    - 指标有用量但审计事件未到(交付延迟 5-15 分钟)→ 本轮静默等下一轮。
-      客户对该链路的时效预期是小时级(主告警 6/12h),15 分钟检查间隔本就远超预期,
-      抢先一轮"嫌疑名单"给不出可行动信息、只制造误导 —— 故不做。
-    - 未开审计(MANTLE_AUDIT_BUCKET 为空)→ 无法确认调用者,只在**首次**发现 mantle
-      用量时提醒一次"开审计才能点名"(状态落 S3),之后静默不骚扰。
-    同一指纹 6 小时内不重复推送,指纹变化(新模型/新调用者)立即再报。"""
-    cfg = cfg or load_alerts()
-    result = {"checked": True, "lookback_min": MANTLE_CHECK_LOOKBACK_MIN,
-              "models": {}, "suspects": [], "alerting": False, "attributed": False,
-              "sent": False, "send_error": "", "suppressed": False}
-    if not (cfg.get("webhook") and (cfg.get("enabled") or force_send)):
-        print("[mantle_check] SKIP: webhook_empty or disabled")
-        return result
-    end = dt.datetime.now(dt.UTC)
-    start = end - dt.timedelta(minutes=MANTLE_CHECK_LOOKBACK_MIN)
-    usage = mantle_usage_scan(cfg.get("region", "global"), MANTLE_CHECK_LOOKBACK_MIN)
-    result["models"] = {m: {"in": int(v["in"]), "out": int(v["out"]), "where": v["where"]}
-                        for m, v in usage.items()}
-    if not usage:
-        print("[mantle_check] no mantle usage in window")
-        return result
-
-    # ---- 未开审计:确认不了调用者,只在首次发现用量时提醒一次,不反复告警 ----
-    if not MANTLE_AUDIT_BUCKET:
-        state = _mantle_state_read()
-        if state.get("no_audit_notified") and not force_send:
-            print("[mantle_check] usage present but no audit trail; already notified once, silent")
-            return result
-        result["alerting"] = True
-        blocks = ["## ℹ️ 检测到 GPT-5.6/mantle 用量(未开启审计)",
-                  f"近 {MANTLE_CHECK_LOOKBACK_MIN} 分钟 mantle 端点有调用,但看板未开启审计 trail,"
-                  "**无法确认调用者及其打标状态**。",
-                  "> 开启方式:重新部署时保留默认 `MantleAudit=true`(`git pull && ./deploy.sh`),"
-                  "之后本告警将**精确点名**未打标的真实调用者;费用约 $0.10/10万次调用。"
-                  "本提醒只发这一次。"]
-        try:
-            resp = dingtalk_send(cfg["webhook"], cfg.get("sign_secret", ""),
-                                 "Bedrock GPT-5.6 用量提示", "\n\n".join(blocks))
-            if resp.get("errcode") == 0:
-                result["sent"] = True
-                state["no_audit_notified"] = True
-                state["no_audit_notified_at"] = end.strftime("%Y-%m-%d %H:%M")
-                _mantle_state_write(state)
-            else:
-                result["send_error"] = f"dingtalk errcode={resp.get('errcode')}"
-        except Exception as e:
-            result["send_error"] = str(e)[:300]
-            print(f"[mantle_check] notify EXCEPTION {type(e).__name__}: {e}")
-        return result
-
-    # ---- 审计档:数据事件是唯一报警依据 ----
-    try:
-        callers, nfiles = mantle_audit_callers(start, end)
-        print(f"[mantle_audit] {len(callers or {})} caller(s) from {nfiles} file(s)")
-    except Exception as e:
-        # 审计读取失败(权限/S3 抖动):留痕等下一轮,不凑嫌疑名单
-        print(f"[mantle_audit] read FAILED, will retry next round: {e!r}")
-        return result
-    if not callers:
-        # 指标有量、事件未到:交付延迟(实测 5-15 分钟)。等下一轮点名,
-        # 不发"嫌疑名单"—— 客户时效预期是小时级,这 15 分钟换来的是准确性
-        print("[mantle_audit] usage present but no events yet (delivery lag), waiting")
-        return result
-    result["attributed"] = True
-    bad = []
-    for arn, c in callers.items():
-        if c["kind"] not in ("role", "user"):
-            # root/联合身份等打不了 IAM 标签,单独列出提醒
-            bad.append({**c, "arn": arn, "status": "untaggable", "reason": "非 Role/User 身份"})
-            continue
-        status = _recheck_principal_tag("", c["kind"], c["name"])
-        if status is None:
-            status = "unknown"
-        if status != "tagged":
-            bad.append({**c, "arn": arn, "status": status, "reason": ""})
-    if not bad:
-        print(f"[mantle_check] all {len(callers)} caller(s) tagged, silent")
-        return result
-
-    result["suspects"] = [{"name": u["name"], "kind": u.get("kind", ""),
-                           "status": u["status"], "count": u.get("count", 0)} for u in bad]
-    result["alerting"] = True
-    # 指纹去重:同样的问题反复响铃只会让人屏蔽机器人;新情况(模型/调用者变化)立即报
-    fp = "|".join(sorted(usage)) + "@" + ",".join(sorted(u["name"] for u in bad))
-    state = _mantle_state_read()
-    now = end.timestamp()
-    since = now - float(state.get("last_sent_epoch", 0) or 0)
-    if not force_send and state.get("fingerprint") == fp and since < MANTLE_SUPPRESS_SEC:
-        result["suppressed"] = True
-        print(f"[mantle_check] suppressed: same fingerprint, {int(since)}s < {MANTLE_SUPPRESS_SEC}s")
-        return result
-
-    def _tok(n):
-        return f"{n / 1e6:.1f}M" if n >= 1e6 else (f"{n / 1e3:.1f}K" if n >= 1e3 else str(int(n)))
-
-    exp = load_settings().get("map_tag_value", "") or "<你的MAP标签值>"
-    blocks = ["## 🚨 GPT-5.6/mantle 无标签调用告警",
-              f"**近 {MANTLE_CHECK_LOOKBACK_MIN} 分钟**检测到 mantle 端点(Responses API)用量:"]
-    lines = []
-    for mid, v in sorted(usage.items(), key=lambda x: -(x[1]["in"] + x[1]["out"])):
-        price, _ = price_for(mid, [], None, "mantle")
-        cost = ((v["in"] / 1e6 * price["in"] + v["out"] / 1e6 * price["out"])
-                if price else None)
-        cost_s = f" ≈ **${cost:.2f}**" if cost is not None else ""
-        lines.append(f"- **{mid}** — in {_tok(v['in'])} · out {_tok(v['out'])}{cost_s}"
-                     f"（{' / '.join(sorted(set(v['where'])))}）")
-    blocks.append("\n".join(lines))
-
-    def _fix_cmd(kind, name):
-        return (f"aws iam tag-{kind} --{kind}-name {name} "
-                f"--tags \"Key=map-migrated,Value={exp}\"")
-
-    blocks.append(f"审计日志确认,窗口内共 **{len(callers)}** 个身份发起过调用,"
-                  f"其中 **{len(bad)} 个未打标**(按调用次数,即为上述用量的真实发起者):")
-    items = []
-    for u in sorted(bad, key=lambda x: -x.get("count", 0))[:10]:
-        icon = "👤" if u["kind"] == "user" else ("🎭" if u["kind"] == "role" else "⚠️")
-        via = " · API key 调用" if u.get("bearer") else ""
-        models = f" · {'/'.join(u['models'])}" if u.get("models") else ""
-        if u["status"] == "untaggable":
-            items.append(f"- {icon} `{u['name']}` — **{u['count']} 次**{models}{via}"
-                         f" — {u['reason']},无法打 IAM 标签,请改用可打标身份调用")
-        else:
-            items.append(f"- {icon} `{u['name']}` — **{u['count']} 次**{models}{via}"
-                         f" — **{u['status']}**\n  修复：`{_fix_cmd(u['kind'], u['name'])}`")
-    blocks.append("\n".join(items))
-    blocks.append("> token 用量为模型总量(审计事件不含逐笔 token 数);调用次数可作分摊参考。")
-    blocks.append("> 给调用方打 `map-migrated` 标签即可分账(MAP IAM principal tagging),"
-                  "无需改代码;mantle 端点不支持资源标签,请勿尝试创建 inference profile。")
-    print(f"[mantle_check] sending: models={list(usage)}, suspects={len(bad)}")
-    try:
-        resp = dingtalk_send(cfg["webhook"], cfg.get("sign_secret", ""),
-                             "Bedrock GPT-5.6 无标签调用告警", "\n\n".join(blocks))
-        if resp.get("errcode") == 0:
-            result["sent"] = True
-            print("[mantle_check] dingtalk OK")
-            _mantle_state_write({"last_sent_epoch": now, "fingerprint": fp,
-                                 "last_sent": dt.datetime.now(dt.UTC).strftime("%Y-%m-%d %H:%M")})
-        else:
-            result["send_error"] = f"dingtalk errcode={resp.get('errcode')} {resp.get('errmsg', '')}"
-            print(f"[mantle_check] dingtalk FAIL {result['send_error']}")
-    except Exception as e:
-        result["send_error"] = str(e)[:300]
-        print(f"[mantle_check] dingtalk EXCEPTION {type(e).__name__}: {e}")
-        traceback.print_exc()
-    return result
 
 
 def regions_for(region):
@@ -2098,10 +1895,6 @@ def _json(obj, code=200):
 def lambda_handler(event, context):
     if isinstance(event, dict) and not event.get("queryStringParameters") and event.get("action") == "scan_principals":
         return {"principals_scanned": run_principals_scan(context)}
-    if isinstance(event, dict) and not event.get("queryStringParameters") and event.get("action") == "mantle_check":
-        result = run_mantle_check(force_send=bool(event.get("force")))
-        print(json.dumps({"mantle_check": result}, ensure_ascii=False))
-        return result
     if isinstance(event, dict) and not event.get("queryStringParameters") and event.get("action") == "refresh_cache":
         out = {"cache_refreshed": write_snapshot_cache()}
         # 走 run_principals_scan 而非直接 write_principals_cache: 顺带维护 job 状态,

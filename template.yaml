@@ -18,10 +18,6 @@ Parameters:
     Type: String
     Default: rate(6 hours)
     Description: 分账告警定时检查频率(EventBridge schedule expression)
-  MantleCheckRate:
-    Type: String
-    Default: rate(15 minutes)
-    Description: GPT-5.6/mantle 无标签调用专项检查频率(轻量,近实时点名未打标的 API key user);置 disabled 关闭
   MantleAudit:
     Type: String
     Default: "true"
@@ -34,8 +30,6 @@ Parameters:
     Description: 是否启用运维深水区面板(错误监控/运行时灰区);默认关闭以精简功能
 
 Conditions:
-  # MantleCheckRate=disabled 时不建专项检查 rule(定时告警 AlertSchedule 不受影响)
-  MantleCheckOn: !Not [!Equals [!Ref MantleCheckRate, disabled]]
   MantleAuditOn: !Equals [!Ref MantleAudit, "true"]
 
 Resources:
@@ -266,8 +260,6 @@ Resources:
           ENABLE_OPS_PANELS: !Ref EnableOpsPanels
           CACHE_BUCKET: !Ref CacheBucket
           MANTLE_AUDIT_BUCKET: !If [MantleAuditOn, !Ref MantleAuditBucket, ""]
-          # 专项检查开着时,主告警不再把 mantle 计入违规(金额仍展示),避免同一笔用量双报
-          MANTLE_CHECK_ON: !If [MantleCheckOn, "true", ""]
 
   FunctionUrl:
     Type: AWS::Lambda::Url
@@ -362,27 +354,6 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: events.amazonaws.com
       SourceArn: !GetAtt AlertSchedule.Arn
-
-  MantleCheckSchedule:
-    Type: AWS::Events::Rule
-    Condition: MantleCheckOn
-    Properties:
-      Description: GPT-5.6/mantle untagged-usage spot check (lightweight, near-realtime)
-      ScheduleExpression: !Ref MantleCheckRate
-      State: ENABLED
-      Targets:
-        - Arn: !GetAtt DashboardFunction.Arn
-          Id: mantle-check
-          Input: '{"action":"mantle_check"}'
-
-  AllowMantleEventsInvoke:
-    Type: AWS::Lambda::Permission
-    Condition: MantleCheckOn
-    Properties:
-      FunctionName: !Ref DashboardFunction
-      Action: lambda:InvokeFunction
-      Principal: events.amazonaws.com
-      SourceArn: !GetAtt MantleCheckSchedule.Arn
 
 Outputs:
   DashboardURL:
