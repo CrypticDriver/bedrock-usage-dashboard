@@ -13,8 +13,8 @@
 | 💰 真实账单 | Cost Explorer 拉 Amazon Bedrock Service 账单行(UnblendedCost,非估算),跨账号一账号一行:总费用 / map-migrated 已打标 / 未打标 / 占比 |
 | 🔑 IAM Principal 打标 | 扫出**有 Bedrock 调用权限的 IAM Role / User**,显示各自 `map-migrated` 打标状态(已打标 / 无效打标 / 未打标)与权限来源,未打标行直接给出可复制的 `aws iam tag-role` 修复命令 —— 对应 MAP 推荐的 **IAM principal tagging**(无需建 inference profile、无需改代码);支持账号下拉、按打标状态筛选与分页 |
 | 🏷️ 分账视角 | 类型列区分**模型 ID / 系统跨区 profile / 应用推理 profile**(绿 = 可按资源标签分账);悬停任意行即显完整 ARN / ModelId |
-| 🔔 分账告警 | 发现不可按资源标签分账的用量 → 推送**钉钉 webhook**(可加签);已用 IAM principal 打标时自动降级为巡检不误报;EventBridge 定时检查,页面可视化配置;支持忽略清单 + 按窗口节流防重复轰炸 |
-| ⚡ GPT-5.6 专项告警 | 高频轻量检查(默认 15 分钟)+ 可选**审计 trail**(默认开,$0.10/10万次调用):发现 mantle 无标签用量时**精确点名真实调用者**(身份/次数/模型/是否 API key)并附打标修复命令;未开审计退回能力嫌疑名单;同一问题 6 小时去重,新情况立即再报 |
+| 🔔 分账告警 | 发现无法按标签归属的用量 → 推送**钉钉 webhook**(可加签),**一条消息覆盖 runtime 与 mantle 两端**;app inference profile 会核查**实际打标状态**(建了没打标照样报,附 `tag-resource` 修复命令);已用 IAM principal 打标时自动降级为巡检不误报;EventBridge 定时检查,页面可视化配置;支持忽略清单 + 按窗口节流防重复轰炸 |
+| 🔍 GPT-5.6 调用归因 | 可选**审计 trail**(默认开,$0.10/10万次调用,CloudTrail 数据事件):分账告警对 mantle 用量直接**点名真实调用者**(身份/次数/模型/是否 API key 调用)并附打标修复命令;审计确认调用者全部已打标则不算违规 |
 | 📸 快照秒开 | 定时任务把 7 天 global 数据与 IAM principal 打标状态快照到 S3,页面打开约 0.3s 出数;点「查询估算」才实时扫描 |
 | 🌍 区域 & global | 单区域查询,或跨全部已启用区域并发聚合;默认查近 7 天 |
 | 🏢 多账号 / 跨 Org | AssumeRole + ExternalId 纳管其他账号,页面一键生成接入命令,**不要求同一 Organization** |
@@ -33,6 +33,7 @@
 | Secrets Manager | `…/prices` 单价 · `…/accounts` 账号注册表 · `…/alerts` 告警配置 |
 | EventBridge Rule | 定时(默认 6h):分账检查 + 刷新快照 |
 | S3 缓存桶 | 私有,7 天生命周期,存 global 快照与 IAM principal 打标快照 |
+| CloudTrail 审计 trail + S3 审计桶(可选,默认开) | 只记 mantle 数据事件(`AWS::BedrockMantle::Project`),30 天生命周期;分账告警据此点名 GPT-5.6 真实调用者。`MANTLE_AUDIT=false ./deploy.sh` 关闭 |
 | BedrockUsageReader | 部署在被纳管账号的只读角色(`onboard-account.yaml`);角色名支持 `BedrockUsageReader*` 后缀,同一账号可被多个看板纳管 |
 
 <details>
@@ -45,12 +46,14 @@ flowchart TD
   subgraph CENTRAL["中心账号"]
     FURL --> L["Lambda<br/>页面 + API"]
     EB["EventBridge<br/>rate(6 hours)"] -->|"分账检查 + 刷新快照"| L
-    L --> CW["CloudWatch<br/>AWS/Bedrock"]
+    L --> CW["CloudWatch<br/>AWS/Bedrock(Mantle)"]
     L --> IAM["IAM<br/>Role/User 标签(只读)"]
     L --> SM["Secrets Manager<br/>prices · accounts · alerts"]
     L <--> S3["S3 缓存桶"]
+    CT["CloudTrail<br/>mantle 数据事件"] --> AS3["S3 审计桶<br/>(30 天)"]
+    AS3 -->|"点名 GPT-5.6 调用者"| L
   end
-  L -->|"发现不可分账用量"| DT["钉钉 webhook"]
+  L -->|"发现无标签用量<br/>(mantle 附调用者点名)"| DT["钉钉 webhook"]
   L -->|"AssumeRole + ExternalId"| RR
   subgraph ORG["其他账号(可跨 Org)"]
     RR["BedrockUsageReader"] --> CW2["CloudWatch"]

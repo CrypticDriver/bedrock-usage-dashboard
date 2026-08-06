@@ -9,7 +9,7 @@
 #   首次:  DASH_PASS='你的密码' ./deploy.sh
 #   更新:  ./deploy.sh                      # 代码/模板变更,密码沿用旧值
 #   进阶:  REGION=us-west-2 STACK=bedrock-dashboard DASH_USER=admin \
-#          ALERT_RATE='rate(12 hours)' DASH_PASS='xxx' ./deploy.sh
+#          ALERT_RATE='rate(12 hours)' MANTLE_AUDIT=false DASH_PASS='xxx' ./deploy.sh
 #
 # 依赖: aws cli v2。卸载: ./destroy.sh
 # =============================================================================

@@ -25,6 +25,9 @@ read -r -p ">> 将删除栈 $STACK(区域 $REGION)及其全部资源,确认? [y/
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 CACHE_BUCKET="${STACK}-cache-${ACCOUNT_ID}"
 aws s3 rm "s3://$CACHE_BUCKET" --recursive >/dev/null 2>&1 && echo ">> 已清空缓存桶 $CACHE_BUCKET" || true
+# mantle 审计桶(v1.10.0+,可能不存在)同样要清空,否则删栈卡在桶非空
+AUDIT_BUCKET="${STACK}-mantle-audit-${ACCOUNT_ID}"
+aws s3 rm "s3://$AUDIT_BUCKET" --recursive >/dev/null 2>&1 && echo ">> 已清空审计桶 $AUDIT_BUCKET" || true
 
 aws cloudformation delete-stack --stack-name "$STACK" --region "$REGION"
 echo ">> 删除中(CloudFront 需先禁用,约 5-15 分钟)…"
