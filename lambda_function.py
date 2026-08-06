@@ -643,42 +643,22 @@ def run_alert_check(cfg=None, force_send=False):
             blocks.append(f"共 **{len(bad)}** 个模型的用量无法按标签归属，"
                           f"**≈ ${total_bad}**：")
             items = []
-            has_mantle = False
-            exp_show = load_settings().get("map_tag_value", "") or "<你的MAP标签值>"
             for i, r in enumerate(bad[:10], 1):
                 name, kind = _label(r["model"], r.get("endpoint", ""))
-                has_mantle = has_mantle or r.get("endpoint") == "mantle"
+                extra = ""
                 if r.get("profile_tag"):
-                    # 建了 app inference profile 但标签没打好 —— 单独讲清楚,
+                    # 建了 app inference profile 但标签没打好 —— 标注状态,
                     # 否则用户会困惑"我明明建了 profile 怎么还报"
                     why = f"（{r['profile_tag_reason']}）" if r.get("profile_tag_reason") else ""
                     state = "未打标签" if r["profile_tag"] == "untagged" else f"标签无效{why}"
-                    items.append(
-                        f"**{i}. {name}** — **${r['cost']}**\n"
-                        f"&nbsp;&nbsp;&nbsp;&nbsp;{kind} · in {_tok(r['in'])} · out {_tok(r['out'])}"
-                        f" · ⚠️ **profile 已建但{state}**\n"
-                        f"&nbsp;&nbsp;&nbsp;&nbsp;修复：`aws bedrock tag-resource "
-                        f"--resource-arn {r.get('arn', '<profile ARN>')} "
-                        f"--tags key={MAP_TAG_KEY},value={exp_show}`")
-                else:
-                    items.append(f"**{i}. {name}** — **${r['cost']}**\n"
-                                 f"&nbsp;&nbsp;&nbsp;&nbsp;{kind} · in {_tok(r['in'])} · out {_tok(r['out'])}")
+                    extra = f" · ⚠️ **profile 已建但{state}**"
+                items.append(f"**{i}. {name}** — **${r['cost']}**\n"
+                             f"&nbsp;&nbsp;&nbsp;&nbsp;{kind} · in {_tok(r['in'])} · out {_tok(r['out'])}{extra}")
             if len(bad) > 10:
                 items.append(f"…等共 {len(bad)} 个模型")
             blocks.append("\n\n".join(items))
-            blocks.append("> 💡 两种分账方式任选其一：\n"
-                          "> **① IAM principal 打标（推荐，无需改代码）** — 给调用 Bedrock 的 "
-                          "IAM Role/User 打 `map-migrated` 标签即可；\n"
-                          "> **② 资源打标** — 为每个应用创建 **application inference profile**，"
-                          "调用时改用其 ARN。\n"
-                          "> ⚠️ 资源标签优先级更高，两者只应选一种。")
-            if has_mantle:
-                blocks.append("> ℹ️ 其中 **Responses API (mantle)** 模型(GPT-5.6 等)的方式②是"
-                              "**给 Bedrock Project 打 `map-migrated` 标签**(不是 inference profile);"
-                              "走已打标 project 的调用即视为合规,看板用量表 project 子行有打标状态。")
             # 审计点名:mantle 用量的真实调用者(数据事件 userIdentity),坐实到人
             if mantle_bad_callers:
-                exp = load_settings().get("map_tag_value", "") or "<你的MAP标签值>"
                 blocks.append(f"🔍 **GPT-5.6/mantle 调用者已由审计日志确认**"
                               f"(窗口内共 {len(mantle_callers)} 个身份,"
                               f"未打标 {len(mantle_bad_callers)} 个):")
@@ -687,14 +667,9 @@ def run_alert_check(cfg=None, force_send=False):
                     icon = "👤" if c["kind"] == "user" else ("🎭" if c["kind"] == "role" else "⚠️")
                     via = " · API key 调用" if c.get("bearer") else ""
                     models = f" · {'/'.join(c['models'])}" if c.get("models") else ""
-                    if c["status"] == "untaggable":
-                        citems.append(f"- {icon} `{c['name']}` — **{c['count']} 次**{models}{via}"
-                                      f" — {c['reason']},无法打 IAM 标签,请改用可打标身份调用")
-                    else:
-                        citems.append(f"- {icon} `{c['name']}` — **{c['count']} 次**{models}{via}"
-                                      f" — **{c['status']}**\n  修复：`aws iam tag-{c['kind']} "
-                                      f"--{c['kind']}-name {c['name']} "
-                                      f"--tags \"Key=map-migrated,Value={exp}\"`")
+                    note = f" — {c['reason']},无法打 IAM 标签" if c["status"] == "untaggable" \
+                        else f" — **{c['status']}**"
+                    citems.append(f"- {icon} `{c['name']}` — **{c['count']} 次**{models}{via}{note}")
                 blocks.append("\n".join(citems))
             elif mantle_note:
                 blocks.append(f"> ℹ️ mantle 调用者归因:{mantle_note}")
