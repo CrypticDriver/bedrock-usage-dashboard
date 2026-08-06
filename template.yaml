@@ -266,6 +266,8 @@ Resources:
           ENABLE_OPS_PANELS: !Ref EnableOpsPanels
           CACHE_BUCKET: !Ref CacheBucket
           MANTLE_AUDIT_BUCKET: !If [MantleAuditOn, !Ref MantleAuditBucket, ""]
+          # 专项检查开着时,主告警不再把 mantle 计入违规(金额仍展示),避免同一笔用量双报
+          MANTLE_CHECK_ON: !If [MantleCheckOn, "true", ""]
 
   FunctionUrl:
     Type: AWS::Lambda::Url

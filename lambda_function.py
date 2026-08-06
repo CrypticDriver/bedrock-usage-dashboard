@@ -43,6 +43,9 @@ ENABLE_OPS_PANELS = os.environ.get("ENABLE_OPS_PANELS", "").lower() in ("1", "tr
 CACHE_BUCKET = os.environ.get("CACHE_BUCKET", "")
 # mantle 审计桶(CloudTrail 数据事件,MantleAudit=false 时为空):有它才能精确点名调用者
 MANTLE_AUDIT_BUCKET = os.environ.get("MANTLE_AUDIT_BUCKET", "")
+# 专项检查是否启用:启用时 mantle 归专项报警(点名到人),主告警对 mantle 只展示不升级,
+# 一笔用量只响一条铃;关掉专项(MantleCheckRate=disabled)时主告警恢复对 mantle 兜底
+MANTLE_CHECK_ON = bool(os.environ.get("MANTLE_CHECK_ON", ""))
 CACHE_KEY = "cache/global-7d.json"
 CACHE_MAX_AGE_SEC = 8 * 3600  # 定时任务每6h刷一次,超8h视为过期
 try:
@@ -497,6 +500,13 @@ def run_alert_check(cfg=None, force_send=False):
     ignore = cfg.get("ignore_list") or []
     bad = [r for r in raw_bad if not _is_ignored(r["id"], ignore)]
     ignored_count = len(raw_bad) - len(bad)
+    # 专项检查启用时,mantle 归它报警(15 分钟粒度、点名到人),主告警对同一笔用量
+    # 不再升级 —— 一笔用量只响一条铃。金额仍在消息里单独展示,全景成本视图不缺块
+    mantle_rows = []
+    if MANTLE_CHECK_ON:
+        mantle_rows = [r for r in bad if r.get("endpoint") == "mantle"]
+        bad = [r for r in bad if r.get("endpoint") != "mantle"]
+    mantle_cost = round(sum(r["cost"] for r in mantle_rows), 2)
     total_bad = round(sum(r["cost"] for r in bad), 2)
     # MAP 新增的 IAM principal tagging(2026-06-08 起生效): 调用方 Role/User 打了 map-migrated
     # 就能分账,直连模型 ID 不再必然"无法分账"。检测到已打标 principal 就把告警降级为巡检,
@@ -515,6 +525,7 @@ def run_alert_check(cfg=None, force_send=False):
     result = {"checked": True, "window_hours": hours, "region": cfg.get("region", "global"),
               "start": start.strftime("%Y-%m-%d %H:%M"), "end": end.strftime("%Y-%m-%d %H:%M"),
               "violations": bad, "violation_cost": total_bad,
+              "mantle_display_cost": mantle_cost, "mantle_deferred": len(mantle_rows),
               "ignored_count": ignored_count, "throttled": throttled,
               "iam_principal_tagged": iam_tagged, "iam_tag_known": iam_known,
               "iam_tag_unknown": tag_unknown, "alerting": alerting,
@@ -592,6 +603,11 @@ def run_alert_check(cfg=None, force_send=False):
         else:
             blocks.append("当前窗口内未发现无标签用量，全部调用均带标签可归属。"
                           if not force_send else "✅ 测试消息：当前窗口内未发现无标签用量。")
+        if mantle_rows:
+            # 仅展示,不计入违规:GPT-5.6/mantle 由专项检查按真实调用者报警,双链路只响一条铃
+            names = "、".join(r["model"] for r in mantle_rows[:5])
+            blocks.append(f"_ℹ️ 另有 GPT-5.6/mantle 用量 ≈ ${mantle_cost}（{names}），"
+                          "由专项检查按真实调用者监控与告警，不计入本条违规_")
         if ignored_count:
             blocks.append(f"_已按忽略清单跳过 {ignored_count} 个模型_")
         print(f"[dingtalk] sending: has_secret={bool(cfg.get('sign_secret'))}, "
