@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.11.1 (2026-08-06)
+
+**修复(合规盲区)**:application inference profile 不再"建了就豁免"
+
+- 主告警此前只要用量走了 app inference profile 就视为可分账,**从不检查 profile 上是否真打了 `map-migrated` 标签**。建了 profile 忘打标、键大小写错、值与期望不符(设置了 `map_tag_value` 时)的用量被静默放过 —— 而这些用量在 CE/CUR 里同样归集不了
+- 现在逐个 profile 查实际标签(`bedrock:ListTagsForResource`):未打标 / 无效打标的照样进违规,消息里单独标注「⚠️ profile 已建但未打标签/标签无效(原因)」并附一行 `aws bedrock tag-resource` 修复命令;查询失败(如缺权限)不误报,落日志
+- 判定口径与 IAM principal 面板一致(键大小写、首尾空格、值不匹配同一套 `tag_mis_reason`);`map_tag_value` 未设置时只查键存在
+- IAM 新增 1 个只读动作 `bedrock:ListTagsForResource`,三处同步(template.yaml / onboard-account.yaml / 页面 🎲 生成命令)。成员账号不补权限时该账号的 profile 标签状态未知(不误报),用量统计不受影响
+
+**升级**:`git pull && ./deploy.sh`;多账号纳管的成员账号建议补 `bedrock:ListTagsForResource`(方式同以往,见合并版指南 ②)。
+
 ## 1.11.0 (2026-08-06)
 
 **合并为单一告警链路**:GPT-5.6/mantle 归因并入主分账告警,不再有独立的专项检查

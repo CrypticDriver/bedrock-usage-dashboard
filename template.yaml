@@ -157,6 +157,9 @@ Resources:
                   - ce:GetCostAndUsage
                   - bedrock:ListInferenceProfiles
                   - bedrock:GetInferenceProfile
+                  # 查 app inference profile 上的实际 map-migrated 标签:
+                  # "建了 profile"不等于"打了标",没打好的照样进违规并给修复命令
+                  - bedrock:ListTagsForResource
                   - bedrock:GetModelInvocationLoggingConfiguration
                   # mantle 端点(GPT-5.6 等)的 Projects 列表:把 CloudWatch 里的
                   # project id 翻译成名字。ListProjects 会连带返回 tags,

@@ -44,6 +44,7 @@ Resources:
                   - cloudwatch:ListMetrics
                   - bedrock:ListInferenceProfiles
                   - bedrock:GetInferenceProfile
+                  - bedrock:ListTagsForResource
                   # mantle(GPT-5.6 等)project id -> 名字;缺此权限仅降级显示 id
                   # ListProjects 连带返回 tags,故需一并授予 ListTagsForResource
                   - bedrock-mantle:ListProjects

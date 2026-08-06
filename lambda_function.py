@@ -403,6 +403,39 @@ def price_for(model_id, regions, sess=None, source="runtime"):
 
 
 
+def profile_tag_status(arn, regions, sess=None):
+    """查 application inference profile 上的实际标签,返回 (status, value, reason)。
+    status: tagged / mistagged / untagged / unknown(查询失败,如缺权限)。
+    "建了 profile"不等于"打了标"—— 没打 map-migrated 的 profile 用量一样归集不了,
+    此前直接豁免是盲区。"""
+    if not arn:
+        return "unknown", "", "无 ARN 可查"
+    sess = sess or DEFAULT_SESS
+    region = arn.split(":")[3] if arn.count(":") >= 4 else ""
+    try:
+        resp = sess.client("bedrock", region_name=region or None, config=FAST) \
+            .list_tags_for_resource(resourceARN=arn)
+        tags = {t["key"]: t.get("value", "") for t in resp.get("tags", [])}
+    except Exception as e:
+        msg = str(e)
+        if "AccessDenied" in msg or "not authorized" in msg:
+            return "unknown", "", "缺 bedrock:ListTagsForResource 权限"
+        print(f"[profile_tags] {arn} FAILED: {e!r}")
+        return "unknown", "", f"查询失败({type(e).__name__})"
+    expected = load_settings().get("map_tag_value", "")
+    val = tags.get(MAP_TAG_KEY)
+    if val is None:
+        alt = next((k for k in tags if k.lower() == MAP_TAG_KEY), None)
+        if alt:
+            return "mistagged", tags[alt], f"标签键大小写不符(是 {alt},应为 {MAP_TAG_KEY})"
+        return "untagged", "", ""
+    if not val:
+        return "untagged", "", "标签键存在但值为空"
+    if expected and val != expected:
+        return "mistagged", val, tag_mis_reason(val, expected)
+    return "tagged", val, ""
+
+
 def is_taggable_profile(mid):
     """只有 application inference profile 能打成本分配标签(可分账)。
     CloudWatch ModelId 三形态: 直连fm id(含点号) / 系统跨区 profile(区域前缀,含点号) / app profile 裸id或ARN。"""
@@ -488,6 +521,17 @@ def run_alert_check(cfg=None, force_send=False):
     data = build_data(cfg.get("region", "global"), start, end)
     # 用 build_data 已算好的 taggable(mantle/Responses API 模型天然不可打标),避免两处逻辑分叉
     raw_bad = [r for r in data["rows"] if not r.get("taggable", is_taggable_profile(r["id"]))]
+    # app inference profile 不能只看"存在"就豁免:profile 上没打(或打错)map-migrated
+    # 标签,用量照样归集不了。逐个查实际标签,没打好的以 profile_untagged 归入违规
+    for r in data["rows"]:
+        if not r.get("taggable"):
+            continue
+        st, val, why = profile_tag_status(r.get("arn", ""), regions_for(cfg.get("region", "global")))
+        if st in ("untagged", "mistagged"):
+            raw_bad.append({**r, "profile_tag": st, "profile_tag_reason": why,
+                            "profile_tag_value": val})
+        elif st == "unknown":
+            print(f"[alert_check] profile tag unknown for {r['id']}: {why}")
     ignore = cfg.get("ignore_list") or []
     bad = [r for r in raw_bad if not _is_ignored(r["id"], ignore)]
     ignored_count = len(raw_bad) - len(bad)
@@ -587,15 +631,29 @@ def run_alert_check(cfg=None, force_send=False):
         blocks = [f"## {'🚨 Bedrock 无标签用量告警' if alerting else '✅ Bedrock 用量巡检'}",
                   f"**近 {hours} 小时**（{result['start']} – {result['end']} UTC · {result['region']}）"]
         if alerting:
-            blocks.append(f"共 **{len(bad)}** 个模型未走 app inference profile，"
-                          f"**≈ ${total_bad}** 无法按标签归属：")
+            blocks.append(f"共 **{len(bad)}** 个模型的用量无法按标签归属，"
+                          f"**≈ ${total_bad}**：")
             items = []
             has_mantle = False
+            exp_show = load_settings().get("map_tag_value", "") or "<你的MAP标签值>"
             for i, r in enumerate(bad[:10], 1):
                 name, kind = _label(r["model"], r.get("endpoint", ""))
                 has_mantle = has_mantle or r.get("endpoint") == "mantle"
-                items.append(f"**{i}. {name}** — **${r['cost']}**\n"
-                             f"&nbsp;&nbsp;&nbsp;&nbsp;{kind} · in {_tok(r['in'])} · out {_tok(r['out'])}")
+                if r.get("profile_tag"):
+                    # 建了 app inference profile 但标签没打好 —— 单独讲清楚,
+                    # 否则用户会困惑"我明明建了 profile 怎么还报"
+                    why = f"（{r['profile_tag_reason']}）" if r.get("profile_tag_reason") else ""
+                    state = "未打标签" if r["profile_tag"] == "untagged" else f"标签无效{why}"
+                    items.append(
+                        f"**{i}. {name}** — **${r['cost']}**\n"
+                        f"&nbsp;&nbsp;&nbsp;&nbsp;{kind} · in {_tok(r['in'])} · out {_tok(r['out'])}"
+                        f" · ⚠️ **profile 已建但{state}**\n"
+                        f"&nbsp;&nbsp;&nbsp;&nbsp;修复：`aws bedrock tag-resource "
+                        f"--resource-arn {r.get('arn', '<profile ARN>')} "
+                        f"--tags key={MAP_TAG_KEY},value={exp_show}`")
+                else:
+                    items.append(f"**{i}. {name}** — **${r['cost']}**\n"
+                                 f"&nbsp;&nbsp;&nbsp;&nbsp;{kind} · in {_tok(r['in'])} · out {_tok(r['out'])}")
             if len(bad) > 10:
                 items.append(f"…等共 {len(bad)} 个模型")
             blocks.append("\n\n".join(items))
@@ -3000,7 +3058,7 @@ function genOnboard(){
   document.getElementById('aExt').value=ext;
   const central=window._central||'';
   const trust='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"'+central+'"},"Action":"sts:AssumeRole","Condition":{"StringEquals":{"sts:ExternalId":"'+ext+'"}}}]}';
-  const perm='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["cloudwatch:GetMetricData","cloudwatch:ListMetrics","bedrock:ListInferenceProfiles","bedrock:GetInferenceProfile","bedrock-mantle:ListProjects","bedrock-mantle:ListTagsForResource","ce:GetCostAndUsage","iam:ListRoles","iam:ListUsers","iam:GetRole","iam:GetUser","iam:ListRoleTags","iam:ListUserTags","iam:ListAttachedRolePolicies","iam:ListRolePolicies","iam:GetRolePolicy","iam:ListAttachedUserPolicies","iam:ListUserPolicies","iam:GetUserPolicy","iam:ListGroupsForUser","iam:ListAttachedGroupPolicies","iam:ListGroupPolicies","iam:GetGroupPolicy","iam:GetPolicy","iam:GetPolicyVersion","iam:ListServiceSpecificCredentials"],"Resource":"*"}]}';
+  const perm='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["cloudwatch:GetMetricData","cloudwatch:ListMetrics","bedrock:ListInferenceProfiles","bedrock:GetInferenceProfile","bedrock:ListTagsForResource","bedrock-mantle:ListProjects","bedrock-mantle:ListTagsForResource","ce:GetCostAndUsage","iam:ListRoles","iam:ListUsers","iam:GetRole","iam:GetUser","iam:ListRoleTags","iam:ListUserTags","iam:ListAttachedRolePolicies","iam:ListRolePolicies","iam:GetRolePolicy","iam:ListAttachedUserPolicies","iam:ListUserPolicies","iam:GetUserPolicy","iam:ListGroupsForUser","iam:ListAttachedGroupPolicies","iam:ListGroupPolicies","iam:GetGroupPolicy","iam:GetPolicy","iam:GetPolicyVersion","iam:ListServiceSpecificCredentials"],"Resource":"*"}]}';
   const rn='BedrockUsageReader-'+Math.random().toString(36).slice(2,6);
   const cmd='aws iam create-role --role-name '+rn+' \\\n'
     +"  --assume-role-policy-document '"+trust+"' \\\n"
