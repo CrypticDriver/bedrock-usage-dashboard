@@ -21,7 +21,7 @@ git pull && ./deploy.sh
 > 🎭 `my-app-role` — **3 次** · gpt-5.6-luna — **untagged**
 >   修复:`aws iam tag-role --role-name my-app-role --tags "Key=map-migrated,Value=..."`
 
-- **费用**:数据事件 $0.10/10 万次调用 + 审计桶少量 S3(30 天自动清理)。GPT-5.6 调用量在几十万次/月以内基本可以忽略
+- **费用**:数据事件 $0.10/10 万次调用 + 审计桶少量 S3(30 天自动清理)。GPT-5.6 调用量在几十万次/月以内基本可以忽略。trail **只录数据事件、不录管理事件**:即使账号已有组织/安全 trail,也不会触发管理事件"第二份副本"计费($2/10万条那项与本 trail 无关)
 - **不想要审计**:`MANTLE_AUDIT=false ./deploy.sh`,告警退回"能力嫌疑名单"模式(修复后的,不漏报)
 - **注意**:审计事件交付有 5–15 分钟延迟,刚发生的调用可能下一轮检查才被点名;`IncludeGlobalServiceEvents` 为 true 是多区域 trail 的硬性要求,但 selector 只选了数据事件,**不会**记录管理事件、不产生额外费用
 

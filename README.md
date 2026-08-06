@@ -33,7 +33,7 @@
 | Secrets Manager | `…/prices` 单价 · `…/accounts` 账号注册表 · `…/alerts` 告警配置 |
 | EventBridge Rule | 定时(默认 6h):分账检查 + 刷新快照 |
 | S3 缓存桶 | 私有,7 天生命周期,存 global 快照与 IAM principal 打标快照 |
-| CloudTrail 审计 trail + S3 审计桶(可选,默认开) | 只记 mantle 数据事件(`AWS::BedrockMantle::Project`),30 天生命周期;分账告警据此点名 GPT-5.6 真实调用者。`MANTLE_AUDIT=false ./deploy.sh` 关闭 |
+| CloudTrail 审计 trail + S3 审计桶(可选,默认开) | 只记 mantle 数据事件(`AWS::BedrockMantle::Project`,$0.10/10万次调用),30 天生命周期;分账告警据此点名 GPT-5.6 真实调用者。**不录管理事件** —— 账号已有组织/安全 trail 的,不会因多这条 trail 产生管理事件付费副本($2/10万条那项与它无关)。`MANTLE_AUDIT=false ./deploy.sh` 关闭 |
 | BedrockUsageReader | 部署在被纳管账号的只读角色(`onboard-account.yaml`);角色名支持 `BedrockUsageReader*` 后缀,同一账号可被多个看板纳管 |
 
 <details>
