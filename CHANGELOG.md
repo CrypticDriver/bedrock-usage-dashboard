@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.11.2 (2026-08-06)
+
+**新增:mantle 的资源打标合规路径 —— Bedrock Project 标签**
+
+- mantle(GPT-5.6)虽不支持 inference profile,但 **Bedrock Project 本身可打 `map-migrated` 标签**(创建/更新 project 时带 tags)。现在:
+  - 用量表 project 子行显示**打标状态徽标**(🏷️ 已打标 / 未打标,悬停有说明)
+  - mantle 模型行的全部用量都落在已打标 project 里(且分项覆盖总量,无"未归集"缺口)→ 该行视为**可分账**,不进违规
+  - 审计点名**跳过只调用过已打标 project 的调用者**(资源打标已合规,无需再打 principal 标);调过未打标 project(含 default)的照常点名
+- default project 不可打标(mantle 控制面限制)——落在 default 里的用量仍需 IAM principal 打标或迁移到自建 project
+- 告警消息里 mantle 的"方式②"从"不支持"改为"给 Bedrock Project 打标";类型列悬停文案同步更新
+- `mantle_projects()` 返回结构变更:{id: name} → {id: {name, tags}}(内部,不影响 API)
+
+**升级**:`git pull && ./deploy.sh`,无手工步骤。已在 mantle 侧按 project 组织用量的,给 project 打上标签即可让对应用量退出违规。
+
 ## 1.11.1 (2026-08-06)
 
 **修复(合规盲区)**:application inference profile 不再"建了就豁免"

@@ -9,7 +9,7 @@
 | 能力 | 说明 |
 |------|------|
 | 📊 用量与成本 | 按模型展示输入 / 输出 / 缓存读写 token 与估算成本;按 UTC 天聚合,对齐账单口径 |
-| 🤖 GPT-5.6 纳管 | 覆盖走 Responses API(`bedrock-mantle` 端点)的 GPT-5.6 Sol/Terra/Luna,并按 **Bedrock Project** 拆分归集(该端点不支持成本分配标签) |
+| 🤖 GPT-5.6 纳管 | 覆盖走 Responses API(`bedrock-mantle` 端点)的 GPT-5.6 Sol/Terra/Luna,按 **Bedrock Project** 拆分归集;project 可打 `map-migrated` 标签,子行显示打标状态,全量落在已打标 project 的模型行视为可分账 |
 | 💰 真实账单 | Cost Explorer 拉 Amazon Bedrock Service 账单行(UnblendedCost,非估算),跨账号一账号一行:总费用 / map-migrated 已打标 / 未打标 / 占比 |
 | 🔑 IAM Principal 打标 | 扫出**有 Bedrock 调用权限的 IAM Role / User**,显示各自 `map-migrated` 打标状态(已打标 / 无效打标 / 未打标)与权限来源,未打标行直接给出可复制的 `aws iam tag-role` 修复命令 —— 对应 MAP 推荐的 **IAM principal tagging**(无需建 inference profile、无需改代码);支持账号下拉、按打标状态筛选与分页 |
 | 🏷️ 分账视角 | 类型列区分**模型 ID / 系统跨区 profile / 应用推理 profile**(绿 = 可按资源标签分账);悬停任意行即显完整 ARN / ModelId |

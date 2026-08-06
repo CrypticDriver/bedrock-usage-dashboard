@@ -545,8 +545,17 @@ def run_alert_check(cfg=None, force_send=False):
             callers, nfiles = mantle_audit_callers(start, end)
             print(f"[mantle_audit] {len(callers or {})} caller(s) from {nfiles} file(s)")
             if callers:
+                # project 已打 map-migrated 的调用是合规路径(资源打标),调它的人
+                # 无需打 principal 标 —— 只点名调过未打标 project 的调用者
+                tagged_projects = set()
+                for r in mantle_rows:
+                    for p in r.get("projects") or []:
+                        if p.get("tagged"):
+                            tagged_projects.add(p["project"])
                 mantle_callers = list(callers.items())
                 for arn, c in callers.items():
+                    if c.get("projects") and all(p in tagged_projects for p in c["projects"]):
+                        continue  # 该调用者只碰过已打标 project
                     if c["kind"] not in ("role", "user"):
                         mantle_bad_callers.append({**c, "arn": arn, "status": "untaggable",
                                                    "reason": "非 Role/User 身份"})
@@ -664,9 +673,9 @@ def run_alert_check(cfg=None, force_send=False):
                           "调用时改用其 ARN。\n"
                           "> ⚠️ 资源标签优先级更高，两者只应选一种。")
             if has_mantle:
-                blocks.append("> ℹ️ 其中 **Responses API (mantle)** 模型(GPT-5.6 等)"
-                              "**不支持方式②**(该端点无资源标签),只能用 ①，"
-                              "或在 mantle 侧按 **Bedrock Project** 归集(看板用量表已按 project 拆分)。")
+                blocks.append("> ℹ️ 其中 **Responses API (mantle)** 模型(GPT-5.6 等)的方式②是"
+                              "**给 Bedrock Project 打 `map-migrated` 标签**(不是 inference profile);"
+                              "走已打标 project 的调用即视为合规,看板用量表 project 子行有打标状态。")
             # 审计点名:mantle 用量的真实调用者(数据事件 userIdentity),坐实到人
             if mantle_bad_callers:
                 exp = load_settings().get("map_tag_value", "") or "<你的MAP标签值>"
@@ -819,8 +828,12 @@ def mantle_audit_callers(start, end):
                 continue
             kind, name, arn = _caller_from_identity(r.get("userIdentity") or {})
             c = callers.setdefault(arn or name, {"kind": kind, "name": name, "count": 0,
-                                                 "models": set(), "bearer": False})
+                                                 "models": set(), "bearer": False,
+                                                 "projects": set()})
             c["count"] += 1
+            for res in r.get("resources") or []:
+                if res.get("type") == "AWS::BedrockMantle::Project" and res.get("ARN"):
+                    c["projects"].add(res["ARN"].split("/")[-1])
             model = (r.get("requestParameters") or {}).get("model", "")
             if model:
                 c["models"].add(model)
@@ -828,6 +841,7 @@ def mantle_audit_callers(start, end):
                 c["bearer"] = True
     for c in callers.values():
         c["models"] = sorted(c["models"])
+        c["projects"] = sorted(c["projects"])
     if len(keys) > 200:
         print(f"[mantle_audit] WARNING: {len(keys)} files in window, only first 200 read")
     return callers, len(keys)
@@ -868,7 +882,8 @@ def mantle_projects(region, sess=None):
         if resp.status_code == 200:
             for p in json.loads(body).get("data", []):
                 if p.get("id"):
-                    out[p["id"]] = p.get("name") or p["id"]
+                    out[p["id"]] = {"name": p.get("name") or p["id"],
+                                    "tags": p.get("tags") or {}}
         else:
             # 常见原因: 角色缺 bedrock-mantle:ListProjects / ListTagsForResource
             # (跨账号需重跑 onboarding 更新 reader 角色权限)
@@ -1070,19 +1085,33 @@ def build_data(region, start, end, sess=None):
         arn = ""
         kind = "模型 ID"
         if mantle:
-            kind = "Responses API (mantle)"  # 如 GPT-5.6,无 cache 指标/不可打标
+            kind = "Responses API (mantle)"  # 如 GPT-5.6,无 cache 指标;分账走 project 标签
         elif taggable:
             arn = profile_info(regions, mid, sess)[2] or (mid if mid.startswith("arn:") else "")
             kind = "应用推理 profile"
         elif mid.startswith(PROFILE_ID_PREFIXES):
             kind = "系统跨区 profile"
         projects = []
+        proj_total = {"in": 0.0, "out": 0.0}
+        all_proj_tagged = bool(proj_agg.get(mid))  # 无 project 分项时不能声称"全打标"
         for proj, pt in sorted(proj_agg.get(mid, {}).items(),
                                key=lambda x: -(x[1]["in"] + x[1]["out"])):
             pcost = sum(pt[k] / 1e6 * price[k] for k in METRICS.values()) if price else 0.0
-            projects.append({"project": proj, "name": pnames.get(proj, proj),
+            pinfo = pnames.get(proj) or {}
+            ptags = pinfo.get("tags") or {}
+            tagged = bool(str(ptags.get(MAP_TAG_KEY, "") or "").strip())
+            all_proj_tagged = all_proj_tagged and tagged
+            proj_total["in"] += pt["in"]
+            proj_total["out"] += pt["out"]
+            projects.append({"project": proj, "name": pinfo.get("name", proj),
+                             "tagged": tagged, "tagValue": ptags.get(MAP_TAG_KEY, ""),
                              "in": int(pt["in"]), "out": int(pt["out"]),
                              "cost": round(pcost, 2)})
+        if mantle:
+            # project 打了 map-migrated = mantle 的资源打标合规路径。全部分项都在
+            # 已打标 project 里、且分项覆盖了总量(无"未归集"缺口)才算行级合规
+            covered = (t["in"] + t["out"]) <= proj_total["in"] + proj_total["out"] + 1
+            taggable = all_proj_tagged and covered
         rows.append({"id": mid, "model": display_model(mid, regions, sess),
                      "kind": kind, "arn": arn, "taggable": taggable,
                      "endpoint": endpoint, "projects": projects,
@@ -2581,7 +2610,7 @@ function renderMain(){
     <thead><tr><th>模型</th><th>类型</th><th>输入</th><th>输出</th><th>缓存读</th><th>缓存写</th><th>估算成本</th></tr></thead>
     <tbody>${d.rows.map(x=>`<tr data-tip="${x.arn||x.id}">
       <td>${x.model}</td>
-      <td style="text-align:left"><span class="pill ${x.taggable?'ok':'warn'}" title="${x.taggable?(x.arn||x.id):(x.endpoint==='mantle'?'Responses API(mantle)端点:不支持成本分配标签,且无缓存 token 指标':'不可按资源标签分账;但若调用方 IAM Role/User 已打 map-migrated 标签,这部分用量仍可分账 —— 见「IAM Principal 打标」面板')}">${x.kind||''}</span></td>
+      <td style="text-align:left"><span class="pill ${x.taggable?'ok':'warn'}" title="${x.taggable?(x.endpoint==='mantle'?'全部用量都在已打 map-migrated 标签的 Project 里,可按 project 标签分账':(x.arn||x.id)):(x.endpoint==='mantle'?'Responses API(mantle)端点:给 Bedrock Project 打 map-migrated 标签即可分账(见 project 子行),无缓存 token 指标':'不可按资源标签分账;但若调用方 IAM Role/User 已打 map-migrated 标签,这部分用量仍可分账 —— 见「IAM Principal 打标」面板')}">${x.kind||''}</span></td>
       <td>${tok(x.in)}</td><td>${tok(x.out)}</td>
       <td>${x.endpoint==='mantle'?'<span class="muted" title="mantle 端点无缓存 token 指标">—</span>':tok(x.cache_read)}</td>
       <td>${x.endpoint==='mantle'?'<span class="muted" title="mantle 端点无缓存 token 指标">—</span>':tok(x.cache_write)}</td>
@@ -2594,7 +2623,8 @@ function projRows(x){
   // 只有单个 default 时无拆分意义,不展开
   if(ps.length<2&&(!ps.length||ps[0].project==='default'))return '';
   return ps.map(p=>`<tr class="subrow" data-tip="${esc(p.project)}">
-    <td>↳ <span class="pill" title="Bedrock Project: ${esc(p.project)}">📁 ${esc(p.name)}</span></td>
+    <td>↳ <span class="pill" title="Bedrock Project: ${esc(p.project)}">📁 ${esc(p.name)}</span>${
+      p.project==='(未归集)'?'':(p.tagged?` <span class="pill ok" title="project 已打 map-migrated=${esc(p.tagValue||'')},走它的用量可按 project 标签分账">🏷️</span>`:` <span class="pill warn" title="project 未打 map-migrated 标签;打上即可分账(无需改代码)">未打标</span>`)}</td>
     <td style="text-align:left" class="muted">${p.project==='(未归集)'?'分项与总量差额':'project'}</td>
     <td>${tok(p.in)}</td><td>${tok(p.out)}</td>
     <td>—</td><td>—</td>
