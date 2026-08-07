@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.11.3 (2026-08-07)
+
+**修复:「拉取官方价」恢复可用并大幅扩容**
+
+- AWS 价目已分家(2026 实测),旧实现只查 `AmazonBedrock` 服务码的 `inferenceType` 条目 —— 那里只剩 Claude 2.x/3 初代残留,**4.x/5 新模型一个都拉不到**,按钮基本失效
+- `fetch_price_list` 重写,合并两处价目源:
+  - `AmazonBedrockFoundationModels`:新 Claude 全系(模型名在 servicename、档位在 usagetype;**global 档优先**,与看板 `global.*` 跨区用量口径对齐,区域价兜底)
+  - `AmazonBedrock` 的 mantle 条目(模型 id 内嵌在 usagetype):deepseek/kimi/gemma/qwen/glm/gpt-oss 等 **41 个 Responses API 模型**的官方价首次可自动获取
+- 只收 on-demand 标准档;batch/flex/priority/long-ctx/Reserved/Provisioned 等档位**刻意排除**(另一套计费,混入四元组会算错钱)
+- us-west-2 实测:旧实现 5 个模型 → 新实现 **145 个**
+- ⚠️ GPT-5.6 Sol/Terra/Luna 的商业区价目仍未发布(GovCloud 已有,定价体系不同不能搬),继续用内置价,上线后无需改代码自动接上
+
+**运维提示**:内置默认价与升级指南均未变;存量部署的 Secrets 价目表**不会被自动改动**,建议升级后进「⚙️ 配置 → 单价配置」点一次「拉取官方价」review 后保存 —— 特别注意 **sonnet 若还是 3/15 老价,Sonnet 5 现价为 2/10(global)**,高估 50%
+
+**升级**:`git pull && ./deploy.sh`,无手工步骤。
+
 ## 1.11.2 (2026-08-06)
 
 **新增:mantle 的资源打标合规路径 —— Bedrock Project 标签**

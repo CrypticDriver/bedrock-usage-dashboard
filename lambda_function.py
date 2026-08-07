@@ -283,42 +283,111 @@ def session_for(account):
                          aws_session_token=cr["SessionToken"])
 
 
+def _first_od_price(p):
+    """product 的 OnDemand 第一个价格维度 → USD/1M tokens(价目单位有 1K/1M 两种)。"""
+    for term in p.get("terms", {}).get("OnDemand", {}).values():
+        for dim in term.get("priceDimensions", {}).values():
+            usd = float(dim.get("pricePerUnit", {}).get("USD", 0) or 0)
+            return usd * 1000 if "1K" in dim.get("unit", "") else usd
+    return 0.0
+
+
+# usagetype/tokenType 里的档位词 → 看板价目四元组字段。只收 on-demand 标准档;
+# batch/flex/priority/long-ctx/Reserved/Provisioned 是另一套计费,混进四元组会算错钱
+_TIER_FIELD = [
+    ("cache_read", "cache_read"), ("cachereadinputtokencount", "cache_read"),
+    ("cache-read-tokens", "cache_read"),
+    ("cache_write", "cache_write"), ("cachewriteinputtokencount", "cache_write"),
+    ("cache-write-tokens", "cache_write"),
+    ("inputtokencount", "in"), ("input_tokens", "in"), ("input-tokens", "in"),
+    ("outputtokencount", "out"), ("output_tokens", "out"), ("output-tokens", "out"),
+]
+_TIER_EXCLUDE = ("batch", "flex", "priority", "long-ctx", "long_ctx", "latency",
+                 "reserved", "provisioned", "1h", "30m", "tpm", "modelunits")
+
+
+def _tier_to_field(u):
+    """usagetype 尾段 → 四元组字段;非标准档返回 None。global 与区域档都收,
+    调用方按 'global 优先、区域价兜底' 归并(与 CW 用量的 global.* 口径对齐)。"""
+    low = u.lower()
+    if any(x in low for x in _TIER_EXCLUDE):
+        return None
+    for kw, field in _TIER_FIELD:
+        if kw in low:
+            return field
+    return None
+
+
 def fetch_price_list(region):
-    """调 AWS Price List API 拉取 Bedrock 各模型 on-demand 单价(USD/1M tokens)。"""
+    """调 AWS Price List API 拉取各模型 on-demand 标准档单价(USD/1M tokens)。
+
+    价目分家在三处(2026-08 实测),全部要查:
+    - AmazonBedrockFoundationModels: 新 Claude(4.x/5),模型名在 servicename,
+      档位在 usagetype(有 global 与区域两档,global 便宜 ~10%)
+    - AmazonBedrock: mantle/Responses API 模型(41 个,deepseek/kimi/gemma/gpt-oss…),
+      模型 id 在 usagetype 内嵌(<region>-<model_id>-mantle-<tier>);老 Claude 2/3 的
+      inferenceType 条目也在这里
+    返回 {price_key: {in,out,cache_read,cache_write}};同字段 global 档优先。"""
     pricing = boto3.client("pricing", region_name="us-east-1")  # Price List API 端点
-    filters = [{"Type": "TERM_MATCH", "Field": "servicecode", "Value": "AmazonBedrock"},
-               {"Type": "TERM_MATCH", "Field": "regionCode", "Value": region}]
+    pg = pricing.get_paginator("get_products")
     out = {}
-    paginator = pricing.get_paginator("get_products")
-    for page in paginator.paginate(ServiceCode="AmazonBedrock", Filters=filters):
-        for item in page["PriceList"]:
-            p = json.loads(item)
-            attr = p.get("product", {}).get("attributes", {})
-            model = attr.get("model")
-            itype = (attr.get("inferenceType") or "").lower()
-            if not model or not itype:
-                continue
-            if "cache" in itype and "read" in itype:
-                field = "cache_read"
-            elif "cache" in itype and "write" in itype:
-                field = "cache_write"
-            elif "input" in itype:
-                field = "in"
-            elif "output" in itype:
-                field = "out"
-            else:
-                continue
-            # 取 OnDemand 第一个价格维度
-            for term in p.get("terms", {}).get("OnDemand", {}).values():
-                for dim in term.get("priceDimensions", {}).values():
-                    usd = float(dim.get("pricePerUnit", {}).get("USD", 0) or 0)
-                    unit = dim.get("unit", "")
-                    per_m = usd * 1000 if "1K" in unit else usd  # 1K tokens -> 1M
-                    out.setdefault(model, {"in": 0, "out": 0, "cache_read": 0, "cache_write": 0})
-                    out[model][field] = round(per_m, 4)
-                    break
-                break
-    return out
+    pref = {}  # (model, field) -> 已用 global 价?
+
+    def put(model, field, price, is_global):
+        if not price:
+            return
+        row = out.setdefault(model, {"in": 0, "out": 0, "cache_read": 0, "cache_write": 0})
+        if row[field] and pref.get((model, field)) and not is_global:
+            return  # 已有 global 价,不被区域价覆盖
+        row[field] = round(price, 4)
+        pref[(model, field)] = is_global
+
+    # ① 新 Claude 等(FoundationModels)
+    try:
+        for page in pg.paginate(ServiceCode="AmazonBedrockFoundationModels",
+                                Filters=[{"Type": "TERM_MATCH", "Field": "regionCode",
+                                          "Value": region}]):
+            for item in page["PriceList"]:
+                p = json.loads(item)
+                a = p["product"].get("attributes", {})
+                name = a.get("servicename", "").replace(" (Amazon Bedrock Edition)", "")
+                if not name or name == "Amazon Bedrock":
+                    continue
+                field = _tier_to_field(a.get("usagetype", ""))
+                if field:
+                    put(name, field, _first_od_price(p),
+                        "global" in a.get("usagetype", "").lower())
+    except Exception as e:
+        print(f"[pricelist] FoundationModels failed: {e!r}")
+
+    # ② mantle 模型 + 老 Claude(AmazonBedrock)
+    try:
+        for page in pg.paginate(ServiceCode="AmazonBedrock",
+                                Filters=[{"Type": "TERM_MATCH", "Field": "regionCode",
+                                          "Value": region}]):
+            for item in page["PriceList"]:
+                p = json.loads(item)
+                a = p["product"].get("attributes", {})
+                ut = a.get("usagetype", "")
+                if "-mantle-" in ut:
+                    # USE2-openai.gpt-oss-20b-mantle-input-tokens-standard
+                    mid = ut.split("-mantle-")[0].split("-", 1)[-1]
+                    field = _tier_to_field(ut.split("-mantle-")[-1])
+                    if mid and field:
+                        put(mid, field, _first_od_price(p), "global" in ut.lower())
+                    continue
+                model = a.get("model")
+                itype = (a.get("inferenceType") or "").lower()
+                if not model or not itype:
+                    continue
+                field = _tier_to_field(itype.replace(" ", "_"))
+                if field:
+                    put(model, field, _first_od_price(p), False)
+    except Exception as e:
+        print(f"[pricelist] AmazonBedrock failed: {e!r}")
+
+    # 全空条目(只有排除档的模型)不返回,避免页面塞一堆 0 价卡片
+    return {m: v for m, v in out.items() if any(v.values())}
 
 
 def resolve_price(model_id, table):
@@ -640,36 +709,39 @@ def run_alert_check(cfg=None, force_send=False):
         blocks = [f"## {'🚨 Bedrock 无标签用量告警' if alerting else '✅ Bedrock 用量巡检'}",
                   f"**近 {hours} 小时**（{result['start']} – {result['end']} UTC · {result['region']}）"]
         if alerting:
-            blocks.append(f"共 **{len(bad)}** 个模型的用量无法按标签归属，"
-                          f"**≈ ${total_bad}**：")
+            blocks.append(f"**≈ ${total_bad}** 无法按标签归属（{len(bad)} 个模型）")
+            # 手机端窄屏容不下三行式条目:一行一条,金额置前,微额合并 —— 大钱一眼可见
+            major = [r for r in bad if r["cost"] >= 0.5]
+            minor = [r for r in bad if r["cost"] < 0.5]
             items = []
-            for i, r in enumerate(bad[:10], 1):
+            for r in major[:8]:
                 name, kind = _label(r["model"], r.get("endpoint", ""))
-                extra = ""
+                warn = ""
                 if r.get("profile_tag"):
                     # 建了 app inference profile 但标签没打好 —— 标注状态,
                     # 否则用户会困惑"我明明建了 profile 怎么还报"
-                    why = f"（{r['profile_tag_reason']}）" if r.get("profile_tag_reason") else ""
-                    state = "未打标签" if r["profile_tag"] == "untagged" else f"标签无效{why}"
-                    extra = f" · ⚠️ **profile 已建但{state}**"
-                items.append(f"**{i}. {name}** — **${r['cost']}**\n"
-                             f"&nbsp;&nbsp;&nbsp;&nbsp;{kind} · in {_tok(r['in'])} · out {_tok(r['out'])}{extra}")
-            if len(bad) > 10:
-                items.append(f"…等共 {len(bad)} 个模型")
-            blocks.append("\n\n".join(items))
+                    warn = ("　⚠️ profile 未打标" if r["profile_tag"] == "untagged"
+                            else f"　⚠️ profile 标签无效({r.get('profile_tag_reason', '')})")
+                items.append(f"- **${r['cost']}** {name}（{kind}）{warn}")
+            if len(major) > 8:
+                rest = round(sum(r["cost"] for r in major[8:]), 2)
+                items.append(f"- **${rest}** 其余 {len(major) - 8} 个模型")
+            if minor:
+                mcost = round(sum(r["cost"] for r in minor), 2)
+                mantle_n = sum(1 for r in minor if r.get("endpoint") == "mantle")
+                hint = f"，含 GPT-5.6/mantle {mantle_n} 个" if mantle_n else ""
+                items.append(f"- **${mcost}** 其他 {len(minor)} 个微额模型{hint}")
+            blocks.append("\n".join(items))
             # 审计点名:mantle 用量的真实调用者(数据事件 userIdentity),坐实到人
             if mantle_bad_callers:
-                blocks.append(f"🔍 **GPT-5.6/mantle 调用者已由审计日志确认**"
-                              f"(窗口内共 {len(mantle_callers)} 个身份,"
-                              f"未打标 {len(mantle_bad_callers)} 个):")
+                blocks.append(f"🔍 **GPT-5.6 调用者**（审计确认，共 {len(mantle_callers)} 个身份、"
+                              f"未打标 {len(mantle_bad_callers)} 个）：")
                 citems = []
                 for c in sorted(mantle_bad_callers, key=lambda x: -x.get("count", 0))[:10]:
                     icon = "👤" if c["kind"] == "user" else ("🎭" if c["kind"] == "role" else "⚠️")
-                    via = " · API key 调用" if c.get("bearer") else ""
-                    models = f" · {'/'.join(c['models'])}" if c.get("models") else ""
-                    note = f" — {c['reason']},无法打 IAM 标签" if c["status"] == "untaggable" \
-                        else f" — **{c['status']}**"
-                    citems.append(f"- {icon} `{c['name']}` — **{c['count']} 次**{models}{via}{note}")
+                    via = "（API key）" if c.get("bearer") else ""
+                    note = "，非 Role/User 无法打标" if c["status"] == "untaggable" else ""
+                    citems.append(f"- **{c['name']}**{via} {icon} {c['count']} 次{note}")
                 blocks.append("\n".join(citems))
             elif mantle_note:
                 blocks.append(f"> ℹ️ mantle 调用者归因:{mantle_note}")
