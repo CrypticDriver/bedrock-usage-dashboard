@@ -578,8 +578,11 @@ def _is_ignored(model_id, patterns):
 
 
 def run_alert_check(cfg=None, force_send=False):
-    """扫描窗口内不可按资源标签分账的用量(非 app-inference-profile),命中则推钉钉。
-    若已存在打了 map-migrated 的 IAM principal(MAP 新增的推荐分账方式),降级为巡检不告警。"""
+    """扫描窗口内的无标签用量,命中即推钉钉。合规 = 走了打标正确的资源:
+    runtime → application inference profile(核查实际 map-migrated 标签),
+    mantle → 已打标 Bedrock Project。资源之外的用量一律违规 —— 纯 CW 可判,
+    不做 IAM principal 存在性豁免(那会被一个打了标的闲置身份压掉真违规);
+    mantle 另有审计点名,把违规坐实到调用者。"""
     cfg = cfg or load_alerts()
     hours = max(1, min(48, int(cfg.get("window_hours", 6))))
     print(f"[alert_check] start: region={cfg.get('region', 'global')}, window={hours}h, "
@@ -647,16 +650,13 @@ def run_alert_check(cfg=None, force_send=False):
     # mantle 违规与 runtime 违规合并计数计钱 —— 一条告警覆盖全部
     bad = bad + mantle_rows
     total_bad = round(sum(r["cost"] for r in bad), 2)
-    # MAP 新增的 IAM principal tagging(2026-06-08 起生效): 调用方 Role/User 打了 map-migrated
-    # 就能分账,直连模型 ID 不再必然"无法分账"。检测到已打标 principal 就把告警降级为巡检,
-    # 否则每个窗口都在为已经合规的用量误报。只读缓存,IAM 扫描慢/失败绝不影响告警链路。
-    # 例外:审计已点名的未打标 mantle 调用者是坐实的违规,不因"别处有人打标"而降级。
-    iam_tagged, iam_known = tagged_principal_state()
-    covered = iam_tagged > 0
-    alerting = (bool(bad) and not covered) or bool(mantle_bad_callers)
-    # 快照未扫全且计数为 0: 不能断言"没人打标",但也不能因此压掉告警(那会漏真问题)。
-    # 照常告警,只在消息里标注该结论未确认,让人知道要去面板确认而不是照着结论行动。
-    tag_unknown = bool(bad) and not covered and not iam_known
+    # 判定口径(2026-08-07 定稿):合规 = 走了打标正确的资源 —— runtime 是
+    # application inference profile(v1.11.1 起核查实际标签),mantle 是已打标
+    # project(v1.11.2)。此外的用量一律违规告警,纯 CW 链路可判。
+    # 不再用"存在已打标 IAM principal"做整体降级:那是存在性判断而非归因,
+    # 一个打了标的闲置身份会把所有真违规压成巡检(误报之弊换成漏报之弊)。
+    # IAM principal 打标状态仍在面板可见;mantle 审计点名照常(坐实到人)。
+    alerting = bool(bad)
     # 推送节流: 同一窗口只推一次(按 window_hours 对齐)。EventBridge 扫描频率照旧
     # (定时任务还负责刷快照), 只是重叠窗口不再重复推送。0.9 容差防触发时刻抖动错过整槽。
     state = read_alert_state()
@@ -670,8 +670,7 @@ def run_alert_check(cfg=None, force_send=False):
                                  for c in mantle_bad_callers],
               "mantle_note": mantle_note,
               "ignored_count": ignored_count, "throttled": throttled,
-              "iam_principal_tagged": iam_tagged, "iam_tag_known": iam_known,
-              "iam_tag_unknown": tag_unknown, "alerting": alerting,
+              "alerting": alerting,
               "enabled": cfg.get("enabled", False), "sent": False, "send_error": ""}
     # 无发现也推巡检报告(每窗口一条心跳,链路通断一目了然);节流对两种消息同样生效
     should_send = bool(cfg.get("webhook")) and (cfg.get("enabled") or force_send) and not throttled
@@ -745,27 +744,13 @@ def run_alert_check(cfg=None, force_send=False):
                 blocks.append("\n".join(citems))
             elif mantle_note:
                 blocks.append(f"> ℹ️ mantle 调用者归因:{mantle_note}")
-            if tag_unknown:
-                blocks.append("> ℹ️ 注：最近一次 IAM 扫描**未覆盖全部 principal**，"
-                              "「无人打标」这一判断**尚未确认**——可能已有 Role/User 打了标但没扫到。"
-                              "请到看板「🔑 IAM Principal 打标」面板点「⚡ 全量重扫(后台)」核实。")
-        elif bad and covered:
-            blocks.append(f"窗口内有 **{len(bad)}** 个模型未走 app inference profile"
-                          f"（≈ ${total_bad}），但已检测到 **{iam_tagged}** 个打了 "
-                          "`map-migrated` 标签的 IAM principal，这部分用量可经 "
-                          "**IAM principal 标签**分账，故不告警。")
-            blocks.append("> ⚠️ 请确认这些用量确实由已打标的 Role/User 发起；"
-                          "另注意资源标签优先级高于 IAM principal 标签，两者只应选一种。"
-                          "详见看板「🔑 IAM Principal 打标」面板。")
         else:
             blocks.append("当前窗口内未发现无标签用量，全部调用均带标签可归属。"
                           if not force_send else "✅ 测试消息：当前窗口内未发现无标签用量。")
         if ignored_count:
             blocks.append(f"_已按忽略清单跳过 {ignored_count} 个模型_")
         print(f"[dingtalk] sending: has_secret={bool(cfg.get('sign_secret'))}, "
-              f"violations={len(bad)}, alerting={alerting}, "
-              f"iam_principal_tagged={iam_tagged}, iam_tag_known={iam_known}, "
-              f"force_send={force_send}")
+              f"violations={len(bad)}, alerting={alerting}, force_send={force_send}")
         try:
             resp = dingtalk_send(cfg["webhook"], cfg.get("sign_secret", ""),
                                  "Bedrock 无标签用量告警" if alerting else "Bedrock 用量巡检",
@@ -1983,21 +1968,6 @@ def run_principals_scan(context=None):
         traceback.print_exc()
         write_principals_job("failed", started_at=started, error=str(e)[:300])
         return False
-
-
-def tagged_principal_state():
-    """(已打标 principal 数, 该结论是否可信)。仅读缓存 —— 告警链路不能因 IAM 扫描慢/失败而挂。
-
-    快照未扫全且计数为 0 时返回 known=False:那 0 可能只是"没扫到",
-    不能据此断言"没人打标"。计数 >0 即便快照未扫全也可信(下界已足够证明存在打标)。"""
-    snap = read_principals_cache()
-    if not snap:
-        return 0, False
-    try:
-        n = int((snap.get("totals") or {}).get("tagged", 0) or 0)
-    except (TypeError, ValueError):
-        n = 0
-    return n, (n > 0 or not snap.get("partial"))
 
 
 

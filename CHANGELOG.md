@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.12.0 (2026-08-07)
+
+**行为变更(判定口径定稿):合规 = 打标正确的资源,删除 IAM principal 存在性豁免**
+
+- 违规判定收敛为纯资源标签口径,CW 链路即可判:
+  - **runtime**(Claude/Nova 等)→ 用量走 **application inference profile 且 profile 已打正确 `map-migrated`**;此外(直连模型 ID、系统跨区 profile、profile 未打标)一律违规
+  - **mantle**(GPT-5.6 等)→ 用量落在**已打标 Bedrock Project**;此外违规,并由审计点名坐实到调用者
+- **删除 v1.8.0 的 principal 存在性豁免**:"账号里存在任何已打标 IAM principal 就整体降级为巡检"是存在性判断而非归因 —— 一个打了标的闲置身份会把所有真违规压成巡检(漏报)。IAM principal 打标状态仍在「🔑 IAM Principal 打标」面板完整可见,mantle 审计点名不受影响
+- 返回值移除 `iam_principal_tagged` / `iam_tag_known` / `iam_tag_unknown`;消息移除"已检测到 N 个打标 principal,故不告警"降级路径与"IAM 扫描未覆盖"附注
+- ⚠️ **升级后告警可能变多**:此前被 principal 豁免压掉的违规会重新出现 —— 这是修复漏报,不是误报。若客户确实以 IAM principal 打标为主要分账方式,请为对应用量建打标 profile/project,或使用忽略清单
+
+**升级**:`git pull && ./deploy.sh`,无手工步骤。
+
 ## 1.11.3 (2026-08-07)
 
 **修复:「拉取官方价」恢复可用并大幅扩容**
