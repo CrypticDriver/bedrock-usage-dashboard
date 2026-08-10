@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.13.1 (2026-08-10)
+
+**修复:mantle 的 project 标签核查与 profile/principal 统一为值比对口径**
+
+- 此前 project 合规判定只看 `map-migrated` 标签**非空**,不与设置的期望值比对 —— 设置期望值后,打错值的 profile 会被抓出,打错值的 project 却被当合规漏过(告警豁免、审计点名豁免同样失守)
+- 现统一复用 principal 的 `_tag_status` 判定:值不符 = mistagged = 不合规;期望值留空时行为不变(任何非空值算已打标)
+- 主看板 project 分项区分「⚠️ 标签无效」(带具体原因与当前值)与「未打标」;告警消息中 mantle 行附 project 标签无效原因
+- project 分项新增 `tagStatus` / `tagReason` 字段
+
+**升级**:`git pull && ./deploy.sh`,无手工步骤。
+
 ## 1.13.0 (2026-08-10)
 
 **改进:map-migrated 标签值设置移到 ⚙️ 配置页,明确为全局判定基准**

@@ -742,6 +742,12 @@ def run_alert_check(cfg=None, force_send=False):
                     # 否则用户会困惑"我明明建了 profile 怎么还报"
                     warn = ("　⚠️ profile 未打标" if r["profile_tag"] == "untagged"
                             else f"　⚠️ profile 标签无效({r.get('profile_tag_reason', '')})")
+                elif r.get("endpoint") == "mantle":
+                    # 同理:project 标签打错值时说明白,别让人以为白打了
+                    mis = next((p for p in r.get("projects") or []
+                                if p.get("tagStatus") == "mistagged"), None)
+                    if mis:
+                        warn = f"　⚠️ project 标签无效({mis.get('tagReason', '')})"
                 items.append(f"- **${r['cost']}** {name}（{kind}）{warn}")
             if len(major) > 8:
                 rest = round(sum(r["cost"] for r in major[8:]), 2)
@@ -1152,12 +1158,16 @@ def build_data(region, start, end, sess=None):
             pcost = sum(pt[k] / 1e6 * price[k] for k in METRICS.values()) if price else 0.0
             pinfo = pnames.get(proj) or {}
             ptags = pinfo.get("tags") or {}
-            tagged = bool(str(ptags.get(MAP_TAG_KEY, "") or "").strip())
+            # 与 profile/principal 同口径:核对实际值,打错值(mistagged)不算合规,
+            # 否则设置了期望值后,值不符的 project 用量会被当合规漏过
+            pst, pval, pwhy = _tag_status(ptags, load_settings().get("map_tag_value", ""))
+            tagged = pst == "tagged"
             all_proj_tagged = all_proj_tagged and tagged
             proj_total["in"] += pt["in"]
             proj_total["out"] += pt["out"]
             projects.append({"project": proj, "name": pinfo.get("name", proj),
-                             "tagged": tagged, "tagValue": ptags.get(MAP_TAG_KEY, ""),
+                             "tagged": tagged, "tagStatus": pst, "tagReason": pwhy,
+                             "tagValue": pval,
                              "in": int(pt["in"]), "out": int(pt["out"]),
                              "cost": round(pcost, 2)})
         if mantle:
@@ -2667,7 +2677,7 @@ function projRows(x){
   if(ps.length<2&&(!ps.length||ps[0].project==='default'))return '';
   return ps.map(p=>`<tr class="subrow" data-tip="${esc(p.project)}">
     <td>↳ <span class="pill" title="Bedrock Project: ${esc(p.project)}">📁 ${esc(p.name)}</span>${
-      p.project==='(未归集)'?'':(p.tagged?` <span class="pill ok" title="project 已打 map-migrated=${esc(p.tagValue||'')},走它的用量可按 project 标签分账">🏷️</span>`:` <span class="pill warn" title="project 未打 map-migrated 标签;打上即可分账(无需改代码)">未打标</span>`)}</td>
+      p.project==='(未归集)'?'':(p.tagged?` <span class="pill ok" title="project 已打 map-migrated=${esc(p.tagValue||'')},走它的用量可按 project 标签分账">🏷️</span>`:(p.tagStatus==='mistagged'?` <span class="pill warn" title="project 标签无效: ${esc(p.tagReason||'')}(当前值 ${esc(p.tagValue||'')})">⚠️ 标签无效</span>`:` <span class="pill warn" title="project 未打 map-migrated 标签;打上即可分账(无需改代码)">未打标</span>`))}</td>
     <td style="text-align:left" class="muted">${p.project==='(未归集)'?'分项与总量差额':'project'}</td>
     <td>${tok(p.in)}</td><td>${tok(p.out)}</td>
     <td>—</td><td>—</td>
