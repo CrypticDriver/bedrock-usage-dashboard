@@ -8,6 +8,7 @@ Bedrock 用量/成本估算看板 — 单 Lambda(HTML + JSON + 趋势数据)
 单价来源:Secrets Manager 密钥 bedrock-dashboard/prices(读不到则用内置默认)。
 """
 import os
+import re
 import json
 import time
 import fnmatch
@@ -43,6 +44,19 @@ ENABLE_OPS_PANELS = os.environ.get("ENABLE_OPS_PANELS", "").lower() in ("1", "tr
 CACHE_BUCKET = os.environ.get("CACHE_BUCKET", "")
 # mantle 审计桶(CloudTrail 数据事件,MantleAudit=false 时为空):有它才能精确点名调用者
 MANTLE_AUDIT_BUCKET = os.environ.get("MANTLE_AUDIT_BUCKET", "")
+# 定时检查频率(CFN 参数 AlertScheduleRate 透传),用于 window_hours 防呆:
+# 窗口小于扫描间隔会产生检查盲区(rate 6h + window 1h → 每轮之间 5h 无人过问)
+ALERT_SCHEDULE_RATE = os.environ.get("ALERT_SCHEDULE_RATE", "")
+
+
+def schedule_rate_hours():
+    """解析 EventBridge rate 表达式为小时数;解析不了(如 cron 表达式)返回 None=不做防呆。"""
+    m = re.match(r"rate\((\d+)\s+(minute|minutes|hour|hours|day|days)\)",
+                 ALERT_SCHEDULE_RATE.strip())
+    if not m:
+        return None
+    n, unit = int(m.group(1)), m.group(2)
+    return n / 60 if unit.startswith("minute") else n * 24 if unit.startswith("day") else n
 CACHE_KEY = "cache/global-7d.json"
 CACHE_MAX_AGE_SEC = 8 * 3600  # 定时任务每6h刷一次,超8h视为过期
 try:
@@ -585,6 +599,13 @@ def run_alert_check(cfg=None, force_send=False):
     mantle 另有审计点名,把违规坐实到调用者。"""
     cfg = cfg or load_alerts()
     hours = max(1, min(48, int(cfg.get("window_hours", 6))))
+    # 防呆:窗口小于扫描间隔会留下检查盲区(两轮检查之间的用量谁都不看,漏报),
+    # 自动抬到扫描间隔。反向(窗口>间隔)只是重叠多算,有节流兜底,不用管。
+    rate_h = schedule_rate_hours()
+    if rate_h and hours < rate_h:
+        print(f"[alert_check] window_hours={hours} < schedule rate {rate_h}h leaves "
+              f"blind spots; using {rate_h}h window instead")
+        hours = min(48, int(rate_h + 0.999))
     print(f"[alert_check] start: region={cfg.get('region', 'global')}, window={hours}h, "
           f"enabled={bool(cfg.get('enabled'))}, has_webhook={bool(cfg.get('webhook'))}, "
           f"has_secret={bool(cfg.get('sign_secret'))}, force_send={force_send}")

@@ -263,6 +263,7 @@ Resources:
           ENABLE_OPS_PANELS: !Ref EnableOpsPanels
           CACHE_BUCKET: !Ref CacheBucket
           MANTLE_AUDIT_BUCKET: !If [MantleAuditOn, !Ref MantleAuditBucket, ""]
+          ALERT_SCHEDULE_RATE: !Ref AlertScheduleRate
 
   FunctionUrl:
     Type: AWS::Lambda::Url
