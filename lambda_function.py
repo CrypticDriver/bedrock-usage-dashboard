@@ -2353,13 +2353,6 @@ tr.prcmd{border-top:none}
       <span class="chev" id="ceToggle">收起 ▴</span>
     </div>
     <div id="ceWrap">
-      <div class="savebar" style="flex-wrap:wrap;margin:12px 0 0">
-        <label class="muted">map-migrated 标签值
-          <input id="ceTagVal" placeholder="如 migABCDE12345 (留空=不校验,任何非空值都算已打标)" style="width:340px"/>
-        </label>
-        <button onclick="saveCeTag()">💾 保存</button>
-        <span id="ceTagSave" style="font-size:13px"></span>
-      </div>
       <div class="chartbar" style="margin:12px 0">
         <button onclick="loadCe()">刷新费用</button>
         <span id="ceMeta" class="muted"></span>
@@ -2369,7 +2362,7 @@ tr.prcmd{border-top:none}
       <div class="muted" style="margin-top:12px;line-height:1.7">
         数据来自 <b>Cost Explorer 真实账单</b>(UnblendedCost,仅 Amazon Bedrock Service 账单行,非估算),按上方日期区间查询,一次覆盖<b>中心 + 全部注册账号</b>;账号/区域选择器不影响本面板。
         map-migrated 拆分需要各账号已激活该成本分配标签;跨账号需 reader 角色有 ce:GetCostAndUsage。每账号每次查询产生 $0.02 CE API 费用。
-        <b>标签值校验:</b>设置 map-migrated 标签值后,只有值完全一致才计入“已打标”;值不符(常见手滑多敲空格)的单独列为<b>无效打标</b>并列出具体错误值,方便去资源上改标。
+        <b>标签值校验:</b>期望的 map-migrated 标签值在 <b>⚙️ 配置</b> 页设置(与分账告警共用),只有值完全一致才计入“已打标”;值不符(常见手滑多敲空格)的单独列为<b>无效打标</b>并列出具体错误值,方便去资源上改标。
       </div>
     </div>
   </div>
@@ -2485,6 +2478,18 @@ tr.prcmd{border-top:none}
   <!--OPS_PANELS_END-->
   </div>
   <div id="configView" style="display:none">
+  <div class="panel">
+    <h3>🏷️ map-migrated 标签值 <span class="muted">· 全部判定的统一基准 · 账单拆分 / 分账告警 / Principal 面板共用</span></h3>
+    <div class="savebar" style="flex-wrap:wrap;margin:12px 0 0">
+      <input id="ceTagVal" placeholder="如 migABCDE12345 (留空=不校验,任何非空值都算已打标)" style="width:340px"/>
+      <button onclick="saveCeTag()">💾 保存</button>
+      <span id="ceTagSave" style="font-size:13px"></span>
+    </div>
+    <div class="muted" style="margin-top:12px;line-height:1.7">
+      设置后,真实账单拆分、<b>分账告警</b>(inference profile / Bedrock Project 标签核查)与 IAM Principal 面板
+      均只认值完全一致的 <code>map-migrated</code> 标签;值不符(常见手滑多敲空格)按<b>无效打标</b>处理。
+    </div>
+  </div>
   <div class="panel">
     <div class="phead" onclick="togglePrice()">
       <h3>⚙️ 单价配置 <span class="muted">· 写入 Secrets Manager · USD / 1M tokens</span></h3>
@@ -2709,8 +2714,7 @@ async function saveCeTag(){
     const d=await getJSON(`?action=save_settings&key=&settings_json=${encodeURIComponent(JSON.stringify(cfg))}`);
     if(d.error)throw new Error(d.error);
     document.getElementById('ceTagVal').value=(d.settings&&d.settings.map_tag_value)||'';
-    m.textContent='✅ 已保存,重新查询中…';
-    await loadCe();m.textContent='✅ 已保存';
+    m.textContent='✅ 已保存,下次检查/查询即生效';
   }catch(e){m.textContent='❌ '+e.message;}
 }
 const escTag=x=>String(x).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/ /g,'<span style="background:rgba(251,191,36,.35);border-radius:2px">·</span>');
@@ -3080,6 +3084,7 @@ function toggleView(){
   c.style.display=showCfg?'block':'none';
   m.style.display=showCfg?'none':'block';
   b.textContent=showCfg?'← 返回看板':'⚙️ 配置';
+  if(showCfg) loadCeTag();
 }
 function toggleAcct(){
   const w=document.getElementById('acctWrap'),open=w.style.display==='none';
