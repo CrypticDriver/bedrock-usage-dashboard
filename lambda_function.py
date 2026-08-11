@@ -661,12 +661,12 @@ def run_alert_check(cfg=None, force_send=False):
                     # 审计确认调用者全部已打标 → 这部分用量合规,不算违规
                     mantle_rows = []
             else:
-                mantle_note = ("审计事件尚未交付(延迟 5-15 分钟),调用者待下窗口确认")
+                mantle_note = ("用量明细尚未生成(延迟 5-15 分钟),来源待下窗口确认")
         except Exception as e:
             print(f"[mantle_audit] read FAILED: {e!r}")
-            mantle_note = "审计日志读取失败,调用者本窗口无法确认"
+            mantle_note = "用量明细读取失败,来源本窗口无法确认"
     elif mantle_rows:
-        mantle_note = ("未开启审计 trail,无法确认调用者;`./deploy.sh` 保留默认 "
+        mantle_note = ("未开启用量明细记录,无法定位来源;`./deploy.sh` 保留默认 "
                        "`MantleAudit=true` 可开启点名")
     # mantle 违规与 runtime 违规合并计数计钱 —— 一条告警覆盖全部
     bad = bad + mantle_rows
@@ -760,10 +760,11 @@ def run_alert_check(cfg=None, force_send=False):
                 hint = f"，含 GPT-5.6/mantle {mantle_n} 个" if mantle_n else ""
                 items.append(f"- **${mcost}** 其他 {len(minor)} 个微额模型{hint}")
             blocks.append("\n".join(items))
-            # 审计点名:mantle 用量的真实调用者(数据事件 userIdentity),坐实到人
+            # mantle 用量按身份汇总(数据事件 userIdentity)。措辞是分账定位口吻,
+            # 不用"调用者/审计确认/点名"这类追责式框架 —— 客户收到告警的第一反应
+            # 应该是"去哪补标签",而不是"我们是不是被安全审计了"
             if mantle_bad_callers:
-                blocks.append(f"🔍 **GPT-5.6 调用者**（审计确认，共 {len(mantle_callers)} 个身份、"
-                              f"未打标 {len(mantle_bad_callers)} 个）：")
+                blocks.append("📋 **GPT-5.6/mantle 用量来源**（供分账定位，以下身份的调用暂无法按标签归属）：")
                 citems = []
                 for c in sorted(mantle_bad_callers, key=lambda x: -x.get("count", 0))[:10]:
                     icon = "👤" if c["kind"] == "user" else ("🎭" if c["kind"] == "role" else "⚠️")
@@ -776,7 +777,7 @@ def run_alert_check(cfg=None, force_send=False):
                     citems.append(f"- **{c['name']}**{via} {icon} {c['count']} 次{note}{loc}")
                 blocks.append("\n".join(citems))
             elif mantle_note:
-                blocks.append(f"> ℹ️ mantle 调用者归因:{mantle_note}")
+                blocks.append(f"> ℹ️ mantle 用量来源:{mantle_note}")
         else:
             blocks.append("当前窗口内未发现无标签用量，全部调用均带标签可归属。"
                           if not force_send else "✅ 测试消息：当前窗口内未发现无标签用量。")
