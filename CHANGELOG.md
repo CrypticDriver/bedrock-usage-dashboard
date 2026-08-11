@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.13.2 (2026-08-11)
+
+**改进:mantle 审计点名附账号与区域,告警可直接定位**
+
+- 点名条目新增 `@ 账号 区域` 后缀(从 CloudTrail 事件的 recipientAccountId/awsRegion 聚合),此前收告警的人要逐账号逐区翻看板才能找到违规用量在哪
+- alert_check 返回值 mantle_callers 同步带 regions/accounts 字段
+- 提示:点名"次数"为 CreateInference 审计事件数,含失败/被拒调用(不产 token),次数多 token 少通常意味着调用方在反复重试失败请求
+
+**升级**:`git pull && ./deploy.sh`,无手工步骤。
+
 ## 1.13.1 (2026-08-10)
 
 **修复:mantle 的 project 标签核查与 profile/principal 统一为值比对口径**

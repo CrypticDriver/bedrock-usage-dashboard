@@ -687,7 +687,9 @@ def run_alert_check(cfg=None, force_send=False):
               "start": start.strftime("%Y-%m-%d %H:%M"), "end": end.strftime("%Y-%m-%d %H:%M"),
               "violations": bad, "violation_cost": total_bad,
               "mantle_callers": [{"name": c["name"], "kind": c["kind"],
-                                  "status": c["status"], "count": c.get("count", 0)}
+                                  "status": c["status"], "count": c.get("count", 0),
+                                  "regions": c.get("regions") or [],
+                                  "accounts": c.get("accounts") or []}
                                  for c in mantle_bad_callers],
               "mantle_note": mantle_note,
               "ignored_count": ignored_count, "throttled": throttled,
@@ -767,7 +769,11 @@ def run_alert_check(cfg=None, force_send=False):
                     icon = "👤" if c["kind"] == "user" else ("🎭" if c["kind"] == "role" else "⚠️")
                     via = "（API key）" if c.get("bearer") else ""
                     note = "，非 Role/User 无法打标" if c["status"] == "untaggable" else ""
-                    citems.append(f"- **{c['name']}**{via} {icon} {c['count']} 次{note}")
+                    # 定位要素直接进消息:收告警的人不用逐账号逐区翻看板找用量
+                    where = " · ".join(c.get("regions") or [])
+                    acct = "/".join(c.get("accounts") or [])
+                    loc = f"　@ {acct} {where}".rstrip() if (where or acct) else ""
+                    citems.append(f"- **{c['name']}**{via} {icon} {c['count']} 次{note}{loc}")
                 blocks.append("\n".join(citems))
             elif mantle_note:
                 blocks.append(f"> ℹ️ mantle 调用者归因:{mantle_note}")
@@ -888,8 +894,14 @@ def mantle_audit_callers(start, end):
             kind, name, arn = _caller_from_identity(r.get("userIdentity") or {})
             c = callers.setdefault(arn or name, {"kind": kind, "name": name, "count": 0,
                                                  "models": set(), "bearer": False,
-                                                 "projects": set()})
+                                                 "projects": set(), "regions": set(),
+                                                 "accounts": set()})
             c["count"] += 1
+            # 排查定位要素:不带这两个,收告警的人得逐账号逐区翻看板找用量在哪
+            if r.get("awsRegion"):
+                c["regions"].add(r["awsRegion"])
+            if r.get("recipientAccountId"):
+                c["accounts"].add(r["recipientAccountId"])
             for res in r.get("resources") or []:
                 if res.get("type") == "AWS::BedrockMantle::Project" and res.get("ARN"):
                     c["projects"].add(res["ARN"].split("/")[-1])
@@ -901,6 +913,8 @@ def mantle_audit_callers(start, end):
     for c in callers.values():
         c["models"] = sorted(c["models"])
         c["projects"] = sorted(c["projects"])
+        c["regions"] = sorted(c["regions"])
+        c["accounts"] = sorted(c["accounts"])
     if len(keys) > 200:
         print(f"[mantle_audit] WARNING: {len(keys)} files in window, only first 200 read")
     return callers, len(keys)
