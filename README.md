@@ -82,7 +82,7 @@ DASH_PASS='你的登录密码' ./deploy.sh
 | `ALERT_RATE` | `rate(6 hours)` | 告警定时频率 |
 | `OPS_PANELS` | `false` | 开启运维面板 |
 
-**更新**:`git pull && ./deploy.sh` —— 密码沿用、栈增量更新,单价/账号/告警配置存于 Secrets **不会丢**。版本看页脚,变更见 [CHANGELOG.md](CHANGELOG.md),可 `git checkout v1.1.0` 锁版本。
+**更新**:`git pull && ./deploy.sh` —— 密码与栈参数沿用(只有本次显式设置的环境变量才会覆盖)、栈增量更新,单价/账号/告警配置存于 Secrets、页面设置存于 S3 **都不会丢**。版本看页脚,变更见 [CHANGELOG.md](CHANGELOG.md),可 `git checkout v1.1.0` 锁版本。
 
 > ⬆️ **从任意旧版本可直接升级到最新版,无需逐版本升级** —— 合并版步骤见 [docs/UPGRADE.md](docs/UPGRADE.md)。
 
